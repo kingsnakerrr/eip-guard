@@ -193,21 +193,61 @@ fetch_source() {
     return 0
   fi
 
-  local url="https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
-  info "下载源码：$url" >&2
   SRC_TMP="$(mktemp -d)"
-  if ! curl -fsSL --connect-timeout 15 --retry 2 "$url" -o "$SRC_TMP/src.tgz"; then
-    err "下载失败。仓库可能还没上传，或 REPO 变量不对。" >&2
+  local out="$SRC_TMP/src.tgz"
+  local ok=0
+
+  # 多个镜像依次尝试；国内直连 github.com 常被重置（HTTP/2 stream 中断）
+  local -a urls=(
+    "https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+    "https://ghproxy.net/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+    "https://gh-proxy.com/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+    "https://ghfast.top/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+    "https://ghproxy.cc/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+  )
+
+  for url in "${urls[@]}"; do
+    info "下载源码：${url}" >&2
+    rm -f "$out"
+    # --http1.1 规避 HTTP/2 stream 中断；--retry 覆盖偶发断流
+    if curl -fsSL --http1.1 \
+         --connect-timeout 15 --max-time 300 \
+         --retry 3 --retry-delay 2 --retry-all-errors \
+         "$url" -o "$out" 2>/dev/null; then
+      if tar tzf "$out" >/dev/null 2>&1; then
+        ok=1
+        break
+      fi
+      warn "下载到的不是有效压缩包，换下一个镜像" >&2
+    fi
+  done
+
+  if [ "$ok" != "1" ]; then
+    err "所有下载地址都失败（网络问题）" >&2
     {
       msg ""
       msg "当前 REPO = ${BLD}${REPO}${RST}"
-      msg "先上传项目到 GitHub，然后这样运行："
-      msg "  ${DIM}REPO=kingsnakerrr/eip-guard bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)${RST}"
+      msg ""
+      msg "常见原因：这台机器连 GitHub 被重置（curl: (18)/(35)/(56)）。"
+      msg ""
+      msg "三个办法，任选其一："
+      msg "  ${BLD}1)${RST} 直接在 GitHub 网页下载压缩包，上传到这台机器后本地安装："
+      msg "     ${DIM}https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz${RST}"
+      msg "     ${DIM}tar xzf ${BRANCH}.tar.gz && cd eip-guard-${BRANCH} && sudo ./install.sh --probe --zone cn --token xxx${RST}"
+      msg ""
+      msg "  ${BLD}2)${RST} 用代理下载（有 clash 等代理时）："
+      msg "     ${DIM}export https_proxy=http://127.0.0.1:7890${RST}"
+      msg "     ${DIM}bash <(curl -Ls .../install.sh) --probe --zone cn --token xxx${RST}"
+      msg ""
+      msg "  ${BLD}3)${RST} 手动 git clone 后本地安装："
+      msg "     ${DIM}git clone https://github.com/${REPO}.git && cd eip-guard && sudo ./install.sh --probe --zone cn${RST}"
+      msg ""
+      msg "注意：本地目录安装会自动使用当前目录的源码，不再联网。"
     } >&2
     return 1
   fi
-  tar tzf "$SRC_TMP/src.tgz" >/dev/null 2>&1 || die "下载的文件不是有效 tar 包（可能是网络劫持，换个网络重试）"
-  tar xzf "$SRC_TMP/src.tgz" -C "$SRC_TMP" || die "解压失败"
+
+  tar xzf "$out" -C "$SRC_TMP" || die "解压失败"
   local root
   root="$(find "$SRC_TMP" -maxdepth 1 -type d -name '*-*' | head -1)"
   [ -n "$root" ] || die "压缩包结构异常"
