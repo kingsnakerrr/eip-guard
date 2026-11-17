@@ -1,5 +1,5 @@
 [Unit]
-Description=EIP Guard probe agent (overseas)
+Description=EIP Guard probe agent
 After=network-online.target
 Wants=network-online.target
 
@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/eip-probe
 EnvironmentFile=/opt/eip-probe/probe.env
+# 改成这台机器的实际位置：cn 或 overseas
+Environment=ZONE=overseas
 ExecStart=/usr/bin/python3 /opt/eip-probe/server.py --port 8787
 Restart=always
 RestartSec=5

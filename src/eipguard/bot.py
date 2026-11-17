@@ -219,8 +219,13 @@ class BotApp:
             detail = await self.engine.inspect(name)
             state = self.engine.target_state(name)
             auto = self.settings.auto and state.auto
+            text = fmt.status_block(name, state, detail, auto, self.settings.failure_threshold)
+            if state.current_ip:
+                link = fmt.pingpe_line(self.cfg.target(name), state.current_ip)
+                if link:
+                    text += f"\n{link}"
             await msg.edit_text(
-                fmt.status_block(name, state, detail, auto, self.settings.failure_threshold),
+                text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -251,6 +256,7 @@ class BotApp:
         names = [args[0]] if args else [t.name for t in self.cfg.targets]
         for name in names:
             try:
+                target = self.cfg.target(name)
                 detail = await self.engine.inspect(name)
             except KeyError:
                 await reply(update, f"没有目标 {name}")
@@ -265,10 +271,13 @@ class BotApp:
                     f"{probe.icon} <b>{fmt.esc(name)}</b> · {fmt.esc(eip.ip if eip else '-')}",
                     f"结论：<b>{fmt.esc(probe.label)}</b>",
                     fmt.probe_lines(probe),
-                    fmt.layer_table(probe),
+                    fmt.port_matrix(probe),
                     f"💡 {fmt.esc(probe.advice)}" if probe.advice else "",
                 ]
             ).strip()
+            links = fmt.pingpe_line(target)
+            if links:
+                text += f"\n{links}"
             await reply(update, text, parse_mode=ParseMode.HTML)
 
     async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -506,7 +515,7 @@ class BotApp:
             lines.append(f"❌ Cloudflare：{fmt.esc(exc)}")
         # 探针
         try:
-            probe = await self.engine.probe_once("1.1.1.1", 443)
+            probe = await self.engine.probe_once("1.1.1.1", [443])
             lines.append(f"✅ 探针：{fmt.esc(probe.summary[:300])}")
         except Exception as exc:  # noqa: BLE001
             lines.append(f"❌ 探针：{fmt.esc(exc)}")

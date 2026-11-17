@@ -100,3 +100,90 @@ def test_parse_id_list():
     assert parse_id_list("") == ()
     with pytest.raises(ConfigError):
         parse_id_list("abc")
+
+
+MULTI = """
+telegram:
+  token: "1:abc"
+  admin_chat_ids: "42"
+cloudflare:
+  api_token: cf
+  zone_name: example.com
+aliyun:
+  accounts:
+    - name: main
+      access_key_id: ak1
+      access_key_secret: sk1
+      default_region: cn-hongkong
+    - name: second
+      access_key_id: ak2
+      access_key_secret: sk2
+      default_region: ap-southeast-1
+detect:
+  port: 443
+  aux_ports: [22, 80]
+  provider: tcp_self
+targets:
+  - name: hk
+    account: main
+    instance_id: i-1
+    dns_records: [hk.example.com]
+  - name: sg
+    account: second
+    instance_id: i-2
+    probe_port: 8443
+    aux_ports: [22]
+    dns_records: [sg.example.com]
+"""
+
+
+def test_multi_account_config(tmp_path):
+    cfg = Config.load(write(tmp_path, MULTI, ENV))
+    assert set(cfg.aliyun.accounts) == {"main", "second"}
+    assert cfg.aliyun.account("second").access_key_id == "ak2"
+    assert cfg.aliyun.account("second").default_region == "ap-southeast-1"
+    assert [t.account for t in cfg.targets] == ["main", "second"]
+
+
+def test_aux_ports_fallback_and_override(tmp_path):
+    cfg = Config.load(write(tmp_path, MULTI, ENV))
+    hk, sg = cfg.targets
+    assert hk.aux_ports == [22, 80], "没写 aux_ports 时用全局"
+    assert sg.aux_ports == [22], "target 写了就覆盖"
+    assert hk.all_ports(443) == [443, 22, 80]
+    assert sg.all_ports(443) == [8443, 22], "业务端口排在最前"
+
+
+def test_unknown_account_raises(tmp_path):
+    text = MULTI.replace("account: second", "account: third")
+    with pytest.raises(ConfigError, match="third"):
+        Config.load(write(tmp_path, text, ENV))
+
+
+def test_duplicate_account_name(tmp_path):
+    text = MULTI.replace('name: "second"', 'name: "main"').replace("name: second", "name: main")
+    with pytest.raises(ConfigError, match="重名"):
+        Config.load(write(tmp_path, text, ENV))
+
+
+def test_single_account_legacy_form(tmp_path):
+    """旧的单账号写法仍然可用。"""
+    cfg = Config.load(write(tmp_path, BASE, ENV))
+    assert list(cfg.aliyun.accounts) == ["default"]
+    assert cfg.targets[0].account == "default"
+
+
+def test_probe_agents_zones(tmp_path):
+    text = MULTI.replace(
+        "  provider: tcp_self",
+        """  provider: probe_agent
+  probe_agent:
+    agents:
+      - {url: "http://1.1.1.1:8787", token: t, zone: cn, name: cn1}
+      - {url: "http://2.2.2.2:8787", token: t, zone: overseas, name: os1}""",
+    )
+    cfg = Config.load(write(tmp_path, text, ENV))
+    assert [(a["zone"], a["name"]) for a in cfg.detect.probe_agents] == [
+        ("cn", "cn1"),
+        ("overseas", "os1"),
+    ]

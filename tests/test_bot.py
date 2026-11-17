@@ -134,8 +134,8 @@ async def test_status_command_shows_probe(app):
     text = update.effective_message.all_text
     assert "1.1.1.1" in text
     assert "连续异常" in text
-    assert "分层结果" in text
-    assert "TCP" in text
+    assert "端口对照" in text
+    assert "国内" in text and "国外" in text
     assert "hk.example.com" in text
 
 

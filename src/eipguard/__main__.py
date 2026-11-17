@@ -51,6 +51,18 @@ async def amain(args: argparse.Namespace) -> int:
         print(f"  探测方式：{cfg.detect.provider} · 间隔 {settings.interval}s · 阈值 {settings.failure_threshold}")
         print(f"  Cloudflare zone：{cfg.cloudflare.zone_name or cfg.cloudflare.zone_id} · proxied={cfg.cloudflare.proxied}")
         print(f"  管理员：{len(cfg.admin_chat_ids)} 人 · 频道 {cfg.channel_id or '未设置'}")
+        accounts = ", ".join(f"{n}({a.access_key_id[:8]}…, {a.default_region})" for n, a in cfg.aliyun.accounts.items())
+        print(f"  阿里云账号：{accounts}")
+        for target in cfg.targets:
+            ports = ", ".join(str(p) for p in target.all_ports(cfg.detect.port))
+            print(
+                f"    - {target.name}: 账号 {target.account} · 实例 {target.instance_id} · "
+                f"端口 {ports} · 域名 {', '.join(target.dns_records) or '无'}"
+            )
+        zones = [a.get("zone", "?") for a in cfg.detect.probe_agents]
+        print(f"  探针：{len(cfg.detect.probe_agents)} 台（{', '.join(zones)}）")
+        if "cn" not in zones or not any(z != "cn" for z in zones):
+            print("  ⚠ 判定需要国内 + 国外各至少一台探针，当前配置无法对比")
         return 0
 
     bot: BotApp | None = None

@@ -17,18 +17,48 @@
 
 | 项目 | 用途 | 在哪拿 |
 |---|---|---|
-| **阿里云 AccessKey ID / Secret** | 换 EIP 的 API 调用 | 建议新建 **RAM 子账号**，只给 EIP 相关权限 |
+| **阿里云 AccessKey ID / Secret** ×N | 换 EIP 的 API 调用（有几个号就几组） | 每个号建一个 **RAM 子账号**，只给 EIP 权限 |
 | **Cloudflare API Token** | 改域名 A 记录 | CF 面板 → My Profile → API Tokens |
 | **Cloudflare Zone**（域名） | 要跟着换的域名 | 例：`example.com` |
 | **ECS 实例 ID** | 要换 IP 的机器 | 控制台，形如 `i-j6cxxxxxxxx` |
 | **Telegram Bot Token** | 机器人本体 | 找 [@BotFather](https://t.me/BotFather) `/newbot` |
 | **Telegram 你的 chat id** | 谁能控制机器人 | 私聊 [@userinfobot](https://t.me/userinfobot)，或用 `/bind` |
 | **Telegram 频道 id**（可选） | 把告警广播出去 | 频道加机器人当管理员，id 形如 `-1001234567890` |
-| **境外 VPS**（推荐） | 判断"被墙"还是"机器挂了" | 一台最便宜的海外小鸡即可 |
+| **国内 VPS** | 提供"国内视角" | 最便宜国内小鸡即可 |
+| **境外 VPS** | 提供"国外视角" | 最便宜海外小鸡即可 |
 
-> 只靠墙内探测无法区分"被墙"和"服务器宕机"，本项目**要求墙内不通 + 墙外通**才判定为被墙，所以需要至少一个墙外探针。没有墙外 VPS 时可临时用 `provider: checkhost`（公共 API，别人家的海外节点，免费但会限流）。
+> **必须两台探针**：一台在国内（`--zone cn`）、一台在国外（`--zone overseas`）。
+> 判定的核心是「同一端口，国内不通 + 国外通」，缺任何一侧都无法下结论。
+> 没有国内机器时可临时用 `provider: checkhost`（公共 API，节点里常有中国的，免费但限流）。
 
-### 阿里云最小权限
+### 多账号
+
+两个阿里云账号各自建一个 RAM 子账号，`config.yaml` 里：
+
+```yaml
+aliyun:
+  accounts:
+    - name: "main"
+      access_key_id: "${ALIYUN_AK_ID}"
+      access_key_secret: "${ALIYUN_AK_SECRET}"
+      default_region: "cn-hongkong"
+    - name: "second"
+      access_key_id: "${ALIYUN_AK_ID_2}"
+      access_key_secret: "${ALIYUN_AK_SECRET_2}"
+      default_region: "ap-southeast-1"
+
+targets:
+  - name: "hk-main"
+    account: "main"          # 用哪个账号
+    instance_id: "i-j6c..."
+  - name: "sg-second"
+    account: "second"
+    instance_id: "i-t4n..."
+```
+
+每个账号的 AK 只对该账号下的 EIP 有权限，互不影响；地域默认取账号的 `default_region`（target 里可覆盖）。
+
+### 阿里云最小权限（每个账号都要建）
 
 新建 RAM 用户 → 编程访问 → 只附加这份自定义策略（[`docs/aliyun-ram-policy.json`](docs/aliyun-ram-policy.json)）：
 
@@ -64,44 +94,54 @@ Zone Resources 只选你那一个域名。**用 Token，不要用 Global API Key
 
 ## 二、快速开始
 
-### 1. 墙外探针（一台海外 VPS，1 分钟）
+### 1. 两台探针（一键）
 
 ```bash
-apt install -y python3-aiohttp     # 或 pip install aiohttp
-mkdir -p /opt/eip-probe && cp probe_agent/server.py /opt/eip-probe/
+# 在墙外 VPS 上
+git clone <仓库> && cd eip-guard
+sudo ./install.sh --probe --zone overseas
 
-echo 'PROBE_TOKEN=一串很长的随机字符' > /opt/eip-probe/probe.env
-
-cp deploy/probe-agent.service /etc/systemd/system/
-systemctl enable --now probe-agent
-curl 'http://127.0.0.1:8787/health'   # {"ok": true, "zone": "overseas"}
+# 在墙内 VPS 上
+sudo ./install.sh --probe --zone cn --token <上面打印的 token>
 ```
 
-记住 `http://这台机器IP:8787` 和 token，下一步要填。
+脚本会自动：装 aiohttp → 生成/沿用 token → 写 systemd → 启动 → 打印健康检查和你该填进主程序的那行 URL。
 
-### 2. 安装主程序（墙内那台要跑机器人的机器）
+两台必须用**同一个 token**。自测：
 
 ```bash
-git clone <你的仓库> eip-guard && cd eip-guard
-cp .env.example .env && chmod 600 .env
-cp config.example.yaml config.yaml
-$EDITOR .env config.yaml          # 填密钥、实例 ID、域名
-./install.sh                      # 装到 /opt/eipguard 并注册 systemd
+curl -s http://127.0.0.1:8787/health
+# {"ok": true, "zone": "cn", ...}
 ```
 
-不想用脚本就手动：
+### 2. 主程序（一键）
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/pip install -e .
-.venv/bin/python -m eipguard -c config.yaml --check-config   # 校验配置
-.venv/bin/python -m eipguard -c config.yaml                  # 启动
+sudo ./install.sh
 ```
 
-也可以 Docker：
+脚本会自动：建 venv → 装依赖 → 生成 `config.yaml` 和 `.env` → 建 `eipguard` 用户 → 注册 systemd（**不自动启动**，等你填完配置）。
+
+然后填两处：
 
 ```bash
-docker compose up -d --build
+sudo -e /opt/eipguard/.env        # 密钥 + 两台探针地址
+sudo -e /opt/eipguard/config.yaml # 账号、实例、域名、端口
+```
+
+校验 + 试跑（只探测，不改任何东西）：
+
+```bash
+cd /opt/eipguard
+.venv/bin/python -m eipguard -c config.yaml --check-config
+.venv/bin/python -m eipguard -c config.yaml --once
+```
+
+`--once` 会输出每个目标的判定结论和国内外端口对照，确认判对了再启动：
+
+```bash
+sudo systemctl start eipguard
+sudo journalctl -u eipguard -f
 ```
 
 ### 3. 绑定管理员
@@ -114,23 +154,40 @@ docker compose up -d --build
 
 设置频道：把机器人拉进频道 → 设为管理员 → 要么在 `.env` 填 `TG_CHANNEL_ID`，要么私聊机器人 `/channel -100xxxxxxxxxx`。
 
+### 手动安装 / Docker
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .
+.venv/bin/python -m eipguard -c config.yaml
+# 或
+docker compose up -d --build
+```
+
+### 卸载
+
+```bash
+sudo ./install.sh --uninstall            # 主程序（保留配置和数据）
+sudo ./install.sh --probe --uninstall    # 探针
+```
+
 ---
 
 ## 三、Telegram 命令
 
 | 命令 | 作用 |
 |---|---|
-| `/status` | 所有目标实时状态（IP、EIP、失败次数、每个探针的结果） |
+| `/status` | 所有目标实时状态（IP、判定结论、国内外端口对照） |
 | `/status hk-main` | 单个目标详情 |
 | `/ip` | 快速看当前 IP 和域名 |
-| `/probe [目标]` | 只探测，不改任何东西（显示分层结果） |
+| `/probe [目标]` | 只探测，不改任何东西（显示国内外端口对照 + ping.pe 链接） |
 | `/verdict` | 各种判定类型的定义，以及该不该换 IP |
 | `/switch 目标` | 手动换 IP（有确认按钮） |
 | `/switch all` | 自动挑出异常的目标依次换 |
 | `/dns 目标 [ip]` | 重新同步 CF 解析（不填 ip 用当前 EIP） |
 | `/settings` | 看当前设置 |
 | `/set interval 60` | 检查间隔（秒，≥15） |
-| `/set threshold 3` | 连续失败几次才换 |
+| `/set threshold 3` | 连续异常几次才动作 |
 | `/set cooldown 900` | 两次更换最小间隔（秒） |
 | `/set release on\|off` | 成功后是否释放旧 EIP |
 | `/autoswitch` | 全局自动换 IP 开关 |
@@ -144,12 +201,19 @@ docker compose up -d --build
 示例通知：
 
 ```
-🚨 检测到 IP 被墙，开始更换（自动）
+🔴 IP 被墙，已确认，准备更换 IP
 
 🎯 目标：hk-main
-📤 当前 IP：47.243.1.25
-🧭 原因：自动：连续探测判定被墙
-🔎 墙内不通、墙外正常 → 判定被墙：hk-cn(cn) 不通(timeout) | us-1(overseas) 通 182ms
+📤 IP：47.243.1.25
+📉 连续异常 3/3 次
+🔎 端口 443 国内不通、国外正常，同 IP 其它端口也没有国内可达的 → 判定 IP 被墙
+端口对照（国内 / 国外）
+  443: 国内 ✗(timeout) / 国外 ✓ ← 节点端口
+  22: 国内 ✗(timeout) / 国外 ✓
+  ICMP 国内 通 / 国外 通
+💡 建议：换 IP 有效。
+🔄 正在自动更换 IP…
+🔗 自查：https://ping.pe/47.243.1.25:443?host=hk.example.com
 ```
 
 ```
@@ -159,64 +223,62 @@ docker compose up -d --build
 📤 旧 IP：47.243.1.25
 📥 新 IP：47.243.9.88
 🌐 Cloudflare：2/2 条已更新
-   ✓ hk.example.com hk.example.com → 47.243.9.88
-   ✓ api.example.com api.example.com → 47.243.9.88
-🔎 验证：墙内通 210ms
+   ✓ hk.example.com → 47.243.9.88
+   ✓ api.example.com → 47.243.9.88
+🔎 验证：正常
 ⏱ 耗时 43.2s
+```
+
+如果是服务挂了，则是：
+
+```
+⚫ 服务不可用（不是被墙）
+
+🎯 目标：hk-main
+📤 IP：47.243.1.25
+🔎 端口 443 在国内和国外都连不上 → 不是墙，是服务没起/安全组没放行/防火墙挡住（refused）
+端口对照（国内 / 国外）
+  443: 国内 ✗(refused) / 国外 ✗(refused) ← 节点端口
+💡 这个端口国内外都连不上，换 IP 解决不了。依次检查：① 服务进程在监听吗（ss -lntp）
+   ② 阿里云安全组放行了吗 ③ 系统防火墙 ④ 云盾/黑洞
 ```
 
 ---
 
-## 四、判定逻辑（为什么不会乱换 IP）
+## 四、判定逻辑
 
-### 4.1 分层探测
+**核心：同一个端口，国内测一次、国外测一次。** 这是唯一可靠的判据（也是 ping.pe 的做法）。
 
-只测 "TCP 能不能连上" 是不够的。GFW 的行为有很多种，而且**能 ping 通完全不等于 IP 可用**。所以每轮探测按层记录：
+> 常见误区：以为"22 端口能连"就说明 IP 没被封。错。22 通只证明 22 的服务活着，
+> 和 443 是否被墙是两件独立的事。反过来 22 不通也不能证明 IP 被封（可能是 sshd 挂了）。
+> 详见 [docs/判定规则.md](docs/判定规则.md)。
 
-| 层 | 测什么 | 能发现 |
-|---|---|---|
-| `icmp` | ping | IP 是否被整段丢弃（注意：通也不代表可用） |
-| `tcp` | 节点端口建连 | 端口/整机是否被封 |
-| `tls` | 真实 TLS 握手（带 SNI） | SNI 关键字阻断、证书指纹阻断 |
-| `http` | TLS 之上发真实请求 | "握手能过，一传数据就断" |
-| `aux` | 其它端口（22/80/8443…） | 区分「整台 IP 被封」还是「只封了一个端口」 |
+### 判定表
 
-### 4.2 判定表（墙内 vs 墙外）
+| 业务端口 国内 | 业务端口 国外 | 同 IP 其它端口 国内 | 结论 | 该做什么 | 自动换 IP |
+|---|---|---|---|---|---|
+| ✗ | ✓ | 都不通 | **IP 被墙** | 换 IP | ✅ |
+| ✗ | ✓ | 有能通的 | **端口被墙** | 换端口 | ❌ |
+| ✗ | ✗ | — | **服务不可用** | 查进程/安全组/防火墙 | ❌ |
+| ✓ | — | — | 正常（再看 TLS/HTTP） | — | ❌ |
+| ✓ | ✓ | — | TLS 或数据面被阻断 | 换域名/协议/端口 | ❌ |
+| 缺国内或国外探针 | | | **无法判定** | 补探针 | ❌ |
 
-| ICMP | 节点端口 TCP | 其它端口 | TLS | 墙外 | 结论 | 自动换 IP？ |
-|---|---|---|---|---|---|---|
-| ✓ | ✗ | ✗ | – | ✓ | **IP 被墙** | ✅ 换 |
-| ✓ | ✗ | ✓ | – | ✓ | **端口被墙** | ❌ 不换，换端口 |
-| ✓ | ✓ | – | ✗ | ✓ | **TLS 被阻断**（SNI/指纹） | ❌ 不换，换域名/协议 |
-| ✓ | ✓ | – | ✓ | ✓(但 HTTP 断) | **数据面被阻断** | ❌ 不换，换协议 |
-| 任意 | ✗ | 任意 | – | ✗ | **服务故障，不是墙** | ❌ 不换，查服务 |
-| 缺墙内节点 | – | – | – | ✓ | **无法判定** | ❌ 只观察 |
+- `icmp`（ping）只作为参考信息展示，**不参与判定** —— ping 通不代表可用，ping 不通也不一定是墙。
+- "其它端口"（`aux_ports`）用来区分「整台 IP 被封」和「只封了业务端口」：
+  - 443 国内不通、22 国内能连 → 只有 443 被针对，**换 IP 无效**，该换端口。
+  - 443 和 22 国内都不通、国外都通 → 整台 IP 被墙，**换 IP 有效**。
 
-**你问的那个场景就在第一行**：防火墙封了 IP 之后经常还放行 ICMP（ping 能通），但 443 和你业务用的端口全部连不上——这时如果只看 TCP 或只看 ping，都会得出错误结论。本项目的判定是：
+### 其他保护
 
-> ICMP 通 **但** 节点端口不通 **并且** 其它端口也不通 **并且** 墙外节点正常 → **IP 被墙** → 换 IP 有效。
-
-判断依据是"墙内全灭 + 墙外正常 + 多端口一起灭"，而不是单看 ping 或单个端口。
-
-### 4.3 为什么要测 aux_ports
-
-这是把「IP 被墙」和「只封了 443」分开的唯一办法：
-
-- `443` 不通、`22` 和 `80` 都通 → 只是端口被封，**换 IP 完全没用**（新 IP 的 443 一样会被封），应该换端口或换协议。
-- `443`、`22`、`80` 全不通 → 整台 IP 被封，换 IP 有效。
-
-所以强烈建议在 `detect.aux_ports` 里填上你机器**实际开放的其它端口**（比如 SSH 的 22、面板的 8443、备用 Web 的 80）。不填也能跑，但准确度会下降——项目会明确告诉你"探针未测其它端口"。
-
-### 4.4 其他保护
-
-- `failure_threshold`（默认 3）连续多次才动作，避免网络抖动误换。
-- **只有 `ip_blocked` 会自动换 IP**；端口/TLS/数据面封锁只告警不花钱（可在 `switch.auto_switch_on` 里加 `port_blocked` 等，但不建议）。
-- 新 IP 绑定后**先验证、再改解析**：如果新 IP 也被墙，就释放它并试下一个，域名始终指向能用的地址。
+- `failure_threshold`（默认 3）连续多次才动作，避免抖动误换。
+- **只有 `ip_blocked` 会自动换 IP**；其它结论只告警不花钱（`switch.auto_switch_on` 可扩展）。
+- 新 IP 绑定后**先验证、再改解析**：新 IP 也被墙就释放重试，域名始终指向能用的地址。
 - 任何一步失败都会**回滚**：释放新 EIP、把已改的解析改回、旧 EIP 绑回。
-- 只有部分域名更新失败时不会整体回滚（IP 已可用），但通知里会有 ⚠️ 提示具体哪几条没改成功。
-- `cooldown` 防止短时间内反复换 IP 烧钱。
+- 只有部分域名更新失败时不整体回滚（IP 已可用），但会 ⚠️ 指出哪几条没改成功。
+- 告警里附带 **ping.pe 自查链接**，可人工复核同一套结论。
 
-### 4.5 一条通知长什么样
+### 通知示例
 
 ```
 🔴 IP 被墙，已确认，准备更换 IP
@@ -224,24 +286,27 @@ docker compose up -d --build
 🎯 目标：hk-main
 📤 IP：47.243.1.25
 📉 连续异常 3/3 次
-🔎 ICMP 能通但 443 和其它测试端口全部不通，墙外正常 → IP 被墙
-    （ICMP 被放行是常见假象，不代表 IP 可用）
+🔎 端口 443 国内不通、国外正常，同 IP 其它端口也没有国内可达的 → 判定 IP 被墙
+端口对照（国内 / 国外）
+  443: 国内 ✗(timeout) / 国外 ✓ ← 节点端口
+  22: 国内 ✗(timeout) / 国外 ✓
+  ICMP 国内 通 / 国外 通
 💡 建议：换 IP 有效。
 🔄 正在自动更换 IP…
+🔗 自查：https://ping.pe/47.243.1.25:443?host=hk.example.com
 ```
 
-如果是封端口，则是：
+端口封锁时：
 
 ```
 🟠 端口被墙（换 IP 无效，不自动更换）
 
-📤 IP：47.243.1.25
-🔎 节点端口 443 不通，但其它端口（22✓ 80✗）可连，墙外节点端口正常 → 仅端口被封
-💡 建议：换 IP 通常无效且浪费钱：先换节点端口（如 443→8443），或同时换 IP+换端口。
-ℹ️ 这类封锁换 IP 通常无效，需要换端口/域名/协议。确认要换再发 /switch。
+🔎 端口 443 国内不通、国外正常，但同 IP 的 22 国内能连 → 只封了这一个端口
+端口对照（国内 / 国外）
+  443: 国内 ✗(timeout) / 国外 ✓ ← 节点端口
+  22: 国内 ✓ / 国外 ✓
+💡 建议：只有这一个端口被墙，同 IP 其它端口国内能连 → 换端口（如 443→8443）最有效
 ```
-
----
 
 ## 五、配置说明
 
@@ -295,13 +360,14 @@ detect:
 - 换 IP 期间会短暂出现**两个 EIP 同时在计费**（几十秒），之后释放旧的。保留旧 EIP（`release_old: false`）会持续收未绑定 EIP 的费用。
 - `data/state.json` 存冷却和统计，删掉只影响历史统计，不会误换 IP。
 - `.env` 是明文密钥：`chmod 600 .env`，不要把 `config.yaml` / `.env` 提交进 git（`.gitignore` 已排除）。
-- 建议 AK 只开上面那份最小策略；如果 AK 泄露，别人最多能操作你的 EIP。
+- 建议每个账号的 AK 只开上面那份最小策略；某个 AK 泄露，别人最多能操作**那个账号**的 EIP。
+- 探针端口 8787 要限制来源 IP，只允许主程序那台机器访问，否则等于给别人开了个探测服务。
 - 本程序会**自动花钱**（分配新 EIP、可能保留旧 EIP）。第一次上线建议 `/set release off` 观察一轮，确认流程没问题再打开。
 
 ## 七、开发
 
 ```bash
-.venv/bin/python -m pytest -q     # 67 个测试：分层判定 / CF 客户端 / 换 IP 全流程 / 机器人命令 / 探针
+.venv/bin/python -m pytest -q     # 83 个测试：国内外对比判定 / CF 客户端 / 换 IP 全流程 / 多账号 / 机器人 / 探针
 ```
 
 结构：
@@ -311,12 +377,13 @@ src/eipguard/
   config.py      # YAML + ${ENV} 解析、校验
   cloud/aliyun.py    # EIP 分配/绑定/解绑/释放（异步包装、重试）
   cloud/cloudflare.py # A 记录查询/更新/创建
-  detect/probe.py    # 探针客户端、check-host、判定逻辑
+  detect/probe.py    # 探针客户端、check-host、判定逻辑（国内外同端口对比）
   engine.py      # 状态机：inspect / monitor / switch / rollback / verify
   bot.py         # Telegram 命令与通知
   state.py       # 状态与动态设置持久化
   fmt.py         # 消息渲染
-probe_agent/server.py   # 墙外探针（独立部署，仅需 aiohttp）
+probe_agent/server.py   # 探针（国内/国外各一台，仅需 aiohttp）
+docs/判定规则.md        # 为什么不能靠 22 端口判断
 ```
 
 ## 八、排错
@@ -326,11 +393,13 @@ probe_agent/server.py   # 墙外探针（独立部署，仅需 aiohttp）
 | 换 IP 报 `InvalidAccessKeyId` | AK 写错或子账号被禁用 |
 | 报 `Forbidden.RAM` | 权限策略少了某个 vpc: 动作 |
 | CF 报 `Unable to authenticate` | Token 少了 `Zone:Read` / 没选对 zone |
-| 一直"缺少墙外节点确认" | 探针没通，`/health` 看探针那行；或 `zone` 填错 |
-| 一直"墙内外都不通" | 是服务挂了不是被墙，先查实例/安全组 |
-| 判成"端口被墙"但你觉得 IP 已经废了 | `aux_ports` 里的端口在墙内被独立放行导致误判，换成更少用的端口，或直接 `/switch` 手动换 |
-| 判成"IP 被墙"但其实是服务没起来 | 墙外节点也要能连才行；若墙外探针也连不上会判 DOWN。确认墙外探针的 zone 是 `overseas` |
-| 探针显示 `icmp –` | 探针机器没有 ping 命令：`apt install iputils-ping` |
+| 一直"无法判定：没有国内探针" | 只装了国外探针，或 `zone` 写成 overseas 了 |
+| 一直"无法判定：没有国外探针" | 缺境外探针 |
+| 判成"端口被墙"但你觉得整机都废了 | `aux_ports` 里有个端口恰好国内能连；确认那个端口真的该通，否则从 `aux_ports` 去掉 |
+| 判成"服务不可用" | 国外也连不上业务端口。查：`ss -lntp` 看进程、安全组、firewalld/ufw |
+| 探针显示 `icmp –` | 探针机没有 ping 命令：`apt install iputils-ping`（不影响判定） |
+| 探针连接超时 | 8787 端口没放行，或安全组没开；`curl` 探针 /health 试 |
 | 机器人不回话 | `journalctl -u eipguard -f`，检查 token 和 chat id |
 | 频道收不到 | 机器人不是频道管理员；或 `/channel` 没设 |
-| 新 IP 一换就被墙 | 该地域 IP 段被重点照顾，可以多设 `max_attempts`，或换地域 |
+| 新 IP 一换就被墙 | 该地域 IP 段被重点照顾，多设 `max_attempts`，或换地域 |
+| 想人工复核结论 | 告警里有 ping.pe 链接，点开对比国内外结果 |

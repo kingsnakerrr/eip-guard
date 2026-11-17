@@ -9,14 +9,12 @@ from eipguard.cloud.aliyun import EipInfo
 from eipguard.cloud.cloudflare import DnsRecord
 from eipguard.config import Config, TargetConfig
 from eipguard.detect.probe import (
-    LAYER_AUX,
-    LAYER_ICMP,
-    LAYER_TCP,
-    LAYER_TLS,
     LayerResult,
     NodeResult,
+    PortProbe,
     ProbeOutcome,
     Verdict,
+    judge,
 )
 from eipguard.engine import Engine
 from eipguard.state import Settings, StateStore
@@ -106,14 +104,14 @@ class FakeCloudflare:
 
 
 class FakeDetector:
-    """按顺序返回预设结论；list 用尽后重复最后一个。"""
+    """按 IP 或按顺序返回预设结论；list 用尽后重复最后一个。"""
 
     def __init__(self, results: list[ProbeOutcome]) -> None:
         self.results = results
         self.calls = 0
         self.by_ip: dict[str, ProbeOutcome] = {}
 
-    async def check(self, ip: str, port: int, *, sni: str = "") -> ProbeOutcome:
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
         self.calls += 1
         if ip in self.by_ip:
             return self.by_ip[ip]
@@ -127,90 +125,65 @@ class FakeDetector:
 
 
 class WallDetector(FakeDetector):
-    """旧 IP 被墙、其余 IP 正常 —— 更贴近真实换 IP 场景。"""
+    """旧 IP 被墙、其余 IP 正常 —— 贴近真实换 IP 场景。"""
 
     def __init__(self, walled: set[str]) -> None:
         super().__init__([])
         self.walled = walled
 
-    async def check(self, ip: str, port: int, *, sni: str = "") -> ProbeOutcome:
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
         self.calls += 1
         return blocked_outcome() if ip in self.walled else ok_outcome()
 
 
-def _layer(name: str, ok: bool | None, kind: str = "") -> LayerResult:
-    return LayerResult(name, ok, 10.0 if ok else None, kind, "" if ok else kind)
-
-
-def _cn(**layers: LayerResult) -> NodeResult:
-    return NodeResult("cn", "cn", dict(layers))
-
-
-def _us(**layers: LayerResult) -> NodeResult:
-    base = {
-        LAYER_ICMP: _layer(LAYER_ICMP, True),
-        LAYER_TCP: _layer(LAYER_TCP, True),
-        LAYER_TLS: _layer(LAYER_TLS, True),
-    }
-    base.update(layers)
-    return NodeResult("us", "overseas", base)
+def _probe(port: int, ok: bool, kind: str = "") -> PortProbe:
+    return PortProbe(port, LayerResult(ok, 10.0 if ok else None, kind, "" if ok else kind))
 
 
 def ok_outcome() -> ProbeOutcome:
-    return ProbeOutcome(
-        Verdict.OK,
-        "探测正常",
+    return judge(
         [
-            _cn(**{LAYER_TCP: _layer(LAYER_TCP, True), LAYER_TLS: _layer(LAYER_TLS, True)}),
-            _us(),
+            NodeResult("cn", "cn", LayerResult(True), {443: _probe(443, True)}),
+            NodeResult("us", "overseas", LayerResult(True), {443: _probe(443, True)}),
         ],
+        ports=[443],
     )
 
 
 def blocked_outcome() -> ProbeOutcome:
-    """能 ping 通但端口全不通 → IP 被墙（用户遇到的真实场景）。"""
-    return ProbeOutcome(
-        Verdict.IP_BLOCKED,
-        "ICMP 能通但端口全部不通，墙外正常 → IP 被墙",
+    """能 ping 通但端口全不通、国外正常 → IP 被墙。"""
+    return judge(
         [
-            _cn(
-                **{
-                    LAYER_ICMP: _layer(LAYER_ICMP, True),
-                    LAYER_TCP: _layer(LAYER_TCP, False, "timeout"),
-                    LAYER_AUX: _layer(LAYER_AUX, False, "timeout"),
-                }
-            ),
-            _us(),
+            NodeResult("cn", "cn", LayerResult(True), {443: _probe(443, False, "timeout")}),
+            NodeResult("us", "overseas", LayerResult(True), {443: _probe(443, True)}),
         ],
-        "换 IP 有效。",
+        ports=[443],
     )
 
 
 def port_blocked_outcome() -> ProbeOutcome:
-    return ProbeOutcome(
-        Verdict.PORT_BLOCKED,
-        "节点端口不通但其它端口可连 → 仅端口被封",
+    return judge(
         [
-            _cn(
-                **{
-                    LAYER_TCP: _layer(LAYER_TCP, False, "timeout"),
-                    LAYER_AUX: _layer(LAYER_AUX, True),
-                }
+            NodeResult(
+                "cn", "cn", LayerResult(True),
+                {443: _probe(443, False, "timeout"), 22: _probe(22, True)},
             ),
-            _us(),
+            NodeResult(
+                "us", "overseas", LayerResult(True),
+                {443: _probe(443, True), 22: _probe(22, True)},
+            ),
         ],
-        "换 IP 通常无效且浪费钱。",
+        ports=[443, 22],
     )
 
 
-def down_outcome() -> ProbeOutcome:
-    return ProbeOutcome(
-        Verdict.DOWN,
-        "墙外也连不上 → 服务故障",
+def service_down_outcome() -> ProbeOutcome:
+    return judge(
         [
-            _cn(**{LAYER_TCP: _layer(LAYER_TCP, False, "refused")}),
-            _us(**{LAYER_TCP: _layer(LAYER_TCP, False, "refused")}),
+            NodeResult("cn", "cn", LayerResult(True), {443: _probe(443, False, "refused")}),
+            NodeResult("us", "overseas", LayerResult(True), {443: _probe(443, False, "refused")}),
         ],
+        ports=[443],
     )
 
 
@@ -436,7 +409,7 @@ async def test_down_is_not_treated_as_blocked(tmp_path):
     aliyun = FakeAliyun()
     aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
     cf = FakeCloudflare()
-    engine, store, events = make_engine(tmp_path, FakeDetector([down_outcome()]), aliyun, cf)
+    engine, store, events = make_engine(tmp_path, FakeDetector([service_down_outcome()]), aliyun, cf)
     engine.settings.failure_threshold = 1
     for _ in range(3):
         await engine._check_one("hk")
@@ -471,3 +444,61 @@ async def test_state_persists(tmp_path):
     assert again.get("hk").current_ip == "9.9.9.9"
     assert again.get("hk").switches == 3
     assert again.channel_id == -100123
+
+
+@pytest.mark.asyncio
+async def test_multi_account_uses_correct_client(tmp_path):
+    """两个账号的两台机器，换 IP 必须走各自的 AK。"""
+    cfg = make_cfg(tmp_path)
+    # 改成双账号
+    cfg.aliyun.accounts = {
+        "main": type(next(iter(cfg.aliyun.accounts.values())))(
+            name="main", access_key_id="ak1", access_key_secret="sk1", default_region="cn-hongkong"
+        ),
+        "second": type(next(iter(cfg.aliyun.accounts.values())))(
+            name="second", access_key_id="ak2", access_key_secret="sk2", default_region="ap-southeast-1"
+        ),
+    }
+    cfg.targets = [
+        TargetConfig(name="hk", instance_id="i-1", account="main", probe_port=443, dns_records=["hk.example.com"]),
+        TargetConfig(name="sg", instance_id="i-2", account="second", probe_port=443, dns_records=["sg.example.com"]),
+    ]
+    account1, account2 = FakeAliyun(), FakeAliyun()
+    account1.seed("eip-a1", "1.1.1.1", instance_id="i-1", status="InUse")
+    account2.seed("eip-b1", "2.2.2.2", instance_id="i-2", status="InUse")
+
+    store = StateStore.load(cfg.data_dir / "state.json", ["hk", "sg"], {"auto": True})
+    settings = Settings.from_values({"auto": True, "interval": 1, "failure_threshold": 1, "cooldown": 0}, {})
+    engine = Engine(
+        cfg,
+        store,
+        settings,
+        aliyun_accounts={"main": account1, "second": account2},  # type: ignore[arg-type]
+        cloudflare=FakeCloudflare(),  # type: ignore[arg-type]
+        detector=WallDetector({"1.1.1.1", "2.2.2.2"}),  # type: ignore[arg-type]
+    )
+    engine.cfg.detect.verify_delay = 0
+    engine.cfg.detect.verify_attempts = 1
+
+    r1 = await engine.switch("hk", reason="test")
+    r2 = await engine.switch("sg", reason="test")
+    assert r1.ok and r2.ok
+    # 各自账号内只动了各自的 EIP
+    assert "release:eip-a1" in account1.calls
+    assert not any("eip-a1" in c for c in account2.calls)
+    assert "release:eip-b1" in account2.calls
+    # 地域用的是账号默认地域
+    assert engine.region_for(cfg.target("sg")) == "ap-southeast-1"
+    await engine.close()
+
+
+def test_pingpe_link_shape(tmp_path):
+    from eipguard.engine import pingpe_link
+
+    cfg = make_cfg(tmp_path)
+    target = cfg.target("hk")
+    target.dns_records = ["hk.example.com"]
+    link = pingpe_link(target, "1.2.3.4")
+    assert link.startswith("https://ping.pe/1.2.3.4:443")
+    assert "hk.example.com" in link
+    assert pingpe_link(target, "") == ""

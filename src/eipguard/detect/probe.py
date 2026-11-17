@@ -13,28 +13,22 @@ import aiohttp
 
 from ..config import DetectConfig
 
-# ---------------------------------------------------------------- 分层模型
-# 一次探测按"层"分别记录，这样才能区分"封 IP / 封端口 / 封 TLS / 封流量"。
-# 只测 TCP 连接是最容易误判的：GFW 可以让 SYN/ACK 正常完成，然后在握手或传输阶段再断。
-LAYER_ICMP = "icmp"   # ICMP echo（ping）
-LAYER_TCP = "tcp"     # 节点端口 TCP 建连
-LAYER_AUX = "aux"     # 其它常见端口的 TCP 建连（判断是"整台 IP"还是"单个端口"）
-LAYER_TLS = "tls"     # 节点端口上的 TLS 握手（SNI 阻断会在这里暴露）
-LAYER_HTTP = "http"   # TLS 之上真的发一次 HTTP 请求（可选，判断数据面）
-
-ALL_LAYERS = (LAYER_ICMP, LAYER_TCP, LAYER_AUX, LAYER_TLS, LAYER_HTTP)
+# ---------------------------------------------------------------- 判定模型
+# 核心思想（和 ping.pe 一样）：同一个端口，分别从「国内」和「国外」测。
+#   国内不通 + 国外通   → 这个端口被墙
+#   国内不通 + 国外不通 → 服务/端口本身坏了，不是墙（换 IP 没用）
+#   国内通             → 正常
+# 只看国内、或只看「有没有别的端口通」，都会得出错误结论——那正是上一版的 bug。
 
 
 class Verdict(str, Enum):
     OK = "ok"
-    DEGRADED = "degraded"
-    IP_BLOCKED = "ip_blocked"          # 整台 IP：ICMP 可能通，但所有端口都不通
-    PORT_BLOCKED = "port_blocked"      # 只有节点端口不通，其它端口正常
-    TLS_BLOCKED = "tls_blocked"        # TCP 通，TLS 握手被断（SNI / 指纹）
-    DATA_BLOCKED = "data_blocked"      # 握手通，但一传数据就断
-    DOWN = "down"                       # 墙外也不通：实例/服务故障
-    UNKNOWN = "unknown"                 # 没有墙内节点，无法确认
-
+    IP_BLOCKED = "ip_blocked"            # 节点端口被墙，且这台 IP 上没有别的端口能从国内连上
+    PORT_BLOCKED = "port_blocked"        # 只有节点端口被墙，同 IP 其它端口国内能连
+    TLS_BLOCKED = "tls_blocked"          # TCP 通，TLS 握手被断（SNI/指纹）
+    DATA_BLOCKED = "data_blocked"        # 握手通，一传数据就断
+    SERVICE_DOWN = "service_down"        # 国外也连不上这个端口 → 服务/安全组/防火墙问题
+    UNKNOWN = "unknown"                  # 缺国内或国外节点，无法对比
 
 BLOCKING_VERDICTS = {
     Verdict.IP_BLOCKED,
@@ -45,99 +39,143 @@ BLOCKING_VERDICTS = {
 
 VERDICT_LABELS = {
     Verdict.OK: "正常",
-    Verdict.DEGRADED: "可用但异常",
     Verdict.IP_BLOCKED: "IP 被墙",
     Verdict.PORT_BLOCKED: "端口被墙",
     Verdict.TLS_BLOCKED: "TLS 被阻断",
     Verdict.DATA_BLOCKED: "数据面被阻断",
-    Verdict.DOWN: "服务不可用",
+    Verdict.SERVICE_DOWN: "服务不可用",
     Verdict.UNKNOWN: "无法判定",
 }
 
 VERDICT_ICONS = {
     Verdict.OK: "🟢",
-    Verdict.DEGRADED: "🟡",
     Verdict.IP_BLOCKED: "🔴",
     Verdict.PORT_BLOCKED: "🟠",
     Verdict.TLS_BLOCKED: "🟣",
     Verdict.DATA_BLOCKED: "🟣",
-    Verdict.DOWN: "⚫",
+    Verdict.SERVICE_DOWN: "⚫",
     Verdict.UNKNOWN: "⚪",
 }
 
-# 每种结论建议怎么办。ip_blocked 才默认换 IP，其它先别花钱。
 VERDICT_ADVICE = {
-    Verdict.IP_BLOCKED: "换 IP 有效。",
-    Verdict.PORT_BLOCKED: "换 IP 通常无效且浪费钱：先换节点端口（如 443→8443），或同时给 EIP 换 IP+换端口。",
+    Verdict.IP_BLOCKED: "整台 IP 的这个端口从国内不可达、国外正常，且同 IP 没有其它端口能从国内连上 → 换 IP 有效。",
+    Verdict.PORT_BLOCKED: "只有这一个端口被墙，同 IP 其它端口国内能连 → 换端口（如 443→8443）最有效；换 IP 也可能有用但更贵。",
     Verdict.TLS_BLOCKED: "换 IP 基本无效：这是按 SNI/证书指纹阻断，应换域名、换端口或改用 Reality/无 SNI 方案。",
     Verdict.DATA_BLOCKED: "换 IP 基本无效：TCP 和握手都正常，是按流量特征阻断，应换协议/混淆或换端口。",
-    Verdict.DOWN: "墙外也不通，是实例/服务本身挂了，先查进程、安全组和系统防火墙。",
-    Verdict.UNKNOWN: "缺少墙内探针，无法区分被墙还是故障。",
+    Verdict.SERVICE_DOWN: "国外也连不上这个端口，是服务没起/安全组没放行/服务器防火墙挡住了，换 IP 完全无效。",
+    Verdict.UNKNOWN: "缺少国内或国外探针，无法做「国内不通 + 国外通」的对比。",
     Verdict.OK: "",
-    Verdict.DEGRADED: "部分节点异常，继续观察。",
 }
 
 
 @dataclass
 class LayerResult:
-    layer: str
-    ok: bool | None = None          # None = 未测试 / 探针不支持
+    ok: bool | None = None       # None = 未测试
     ms: float | None = None
-    kind: str = ""                  # timeout / reset / refused / tls / icmp-loss / http
+    kind: str = ""               # timeout / reset / refused / tls / http / icmp-loss
     error: str = ""
-    detail: str = ""                # 例如各端口结果 "80✓ 22✗"
+    detail: str = ""
 
     def mark(self) -> str:
         if self.ok is None:
             return "–"
-        return "✓" if self.ok else "✗"
+        text = "✓" if self.ok else "✗"
+        if self.ok is False and self.kind:
+            text += f"({self.kind})"
+        return text
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "layer": self.layer,
-            "ok": self.ok,
-            "ms": self.ms,
-            "kind": self.kind,
-            "error": self.error,
-            "detail": self.detail,
-        }
+        return {"ok": self.ok, "ms": self.ms, "kind": self.kind, "error": self.error, "detail": self.detail}
+
+
+@dataclass
+class PortProbe:
+    """一个端口在一个探针节点上的结果。"""
+
+    port: int
+    tcp: LayerResult
+    tls: LayerResult | None = None
+    http: LayerResult | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"tcp": self.tcp.to_dict()}
+        if self.tls is not None:
+            out["tls"] = self.tls.to_dict()
+        if self.http is not None:
+            out["http"] = self.http.to_dict()
+        return out
 
 
 @dataclass
 class NodeResult:
-    """一个探针节点的结果。zone: cn=墙内, overseas=墙外。"""
+    """一个探针节点的全部结果。zone: cn = 国内, overseas = 国外。"""
 
     node: str
     zone: str
-    layers: dict[str, LayerResult] = field(default_factory=dict)
+    icmp: LayerResult | None = None
+    ports: dict[int, PortProbe] = field(default_factory=dict)
     error: str = ""
 
-    def layer(self, name: str) -> LayerResult | None:
-        return self.layers.get(name)
+    def port(self, port: int) -> PortProbe | None:
+        return self.ports.get(port)
 
-    def ok_on(self, name: str) -> bool | None:
-        item = self.layers.get(name)
-        return None if item is None else item.ok
-
-    def summary(self) -> str:
-        parts = []
-        for name in (LAYER_ICMP, LAYER_TCP, LAYER_TLS, LAYER_AUX, LAYER_HTTP):
-            item = self.layers.get(name)
-            if item is None:
-                continue
-            text = f"{name}{item.mark()}"
-            if item.ok is False and item.kind:
-                text += f"({item.kind})"
-            parts.append(text)
-        return " ".join(parts)
+    def tcp_ok(self, port: int) -> bool | None:
+        probe = self.ports.get(port)
+        return None if probe is None else probe.tcp.ok
 
     def brief(self) -> str:
-        if self.error and not self.layers:
+        if self.error and not self.ports:
             return f"{self.node}({self.zone}) 探测失败: {self.error}"
-        return f"{self.node}({self.zone}) {self.summary()}"
+        parts = []
+        for port in sorted(self.ports):
+            probe = self.ports[port]
+            text = f"{port}:{probe.tcp.mark()}"
+            if probe.tls is not None and probe.tls.ok is False:
+                text += f" tls✗({probe.tls.kind})"
+            if probe.http is not None and probe.http.ok is False:
+                text += " http✗"
+            parts.append(text)
+        icmp = f" icmp{self.icmp.mark()}" if self.icmp and self.icmp.ok is not None else ""
+        return f"{self.node}({self.zone}){' '.join(parts)}{icmp}"
+
+    def summary(self) -> str:
+        return self.brief()
 
 
-# ---------------------------------------------------------------- 本地探测原语
+@dataclass
+class PortState:
+    """某端口在国内外两侧的对比结果。"""
+
+    port: int
+    cn: str            # ok / fail / untested
+    os: str
+    cn_kind: str = ""
+    os_kind: str = ""
+
+    @property
+    def blocked(self) -> bool:
+        return self.cn == "fail" and self.os == "ok"
+
+    @property
+    def broken(self) -> bool:
+        return self.os == "fail"
+
+    @property
+    def reachable_from_cn(self) -> bool:
+        return self.cn == "ok"
+
+    def line(self) -> str:
+        def mark(state: str, kind: str) -> str:
+            if state == "ok":
+                return "✓"
+            if state == "fail":
+                return f"✗({kind})" if kind else "✗"
+            return "–"
+
+        return f"{self.port}: 国内 {mark(self.cn, self.cn_kind)} / 国外 {mark(self.os, self.os_kind)}"
+
+
+# ---------------------------------------------------------------- 本机探测原语
 def classify_exception(exc: BaseException) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         return "timeout"
@@ -155,24 +193,22 @@ def classify_exception(exc: BaseException) -> str:
 
 
 async def icmp_probe(ip: str, count: int = 2, timeout: float = 2.0) -> LayerResult:
-    """系统 ping。没有 ping 命令或没权限时返回 ok=None（未测），不当作失败。"""
     exe = shutil.which("ping")
     if not exe:
-        return LayerResult(LAYER_ICMP, None, error="本机没有 ping 命令")
+        return LayerResult(None, error="本机没有 ping 命令")
     try:
         proc = await asyncio.create_subprocess_exec(
             exe, "-c", str(count), "-W", str(max(1, int(timeout))), "-n", ip,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         rc = await asyncio.wait_for(proc.wait(), timeout=count * timeout + 3)
     except asyncio.TimeoutError:
-        return LayerResult(LAYER_ICMP, False, kind="timeout", error="ping 超时")
+        return LayerResult(False, kind="timeout", error="ping 超时")
     except (NotImplementedError, PermissionError, OSError) as exc:
-        return LayerResult(LAYER_ICMP, None, error=f"无法执行 ping: {exc}")
+        return LayerResult(None, error=f"无法执行 ping: {exc}")
     if rc == 0:
-        return LayerResult(LAYER_ICMP, True)
-    return LayerResult(LAYER_ICMP, False, kind="icmp-loss", error="100% 丢包")
+        return LayerResult(True)
+    return LayerResult(False, kind="icmp-loss", error="100% 丢包")
 
 
 async def tcp_probe(ip: str, port: int, timeout: float) -> LayerResult:
@@ -180,11 +216,9 @@ async def tcp_probe(ip: str, port: int, timeout: float) -> LayerResult:
     writer: asyncio.StreamWriter | None = None
     try:
         _reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
-        return LayerResult(LAYER_TCP, True, round((time.monotonic() - started) * 1000, 1))
+        return LayerResult(True, round((time.monotonic() - started) * 1000, 1))
     except BaseException as exc:  # noqa: BLE001
-        return LayerResult(
-            LAYER_TCP, False, None, classify_exception(exc), f"{type(exc).__name__}: {exc}"[:160]
-        )
+        return LayerResult(False, None, classify_exception(exc), f"{type(exc).__name__}: {exc}"[:160])
     finally:
         if writer is not None:
             writer.close()
@@ -195,31 +229,26 @@ async def tcp_probe(ip: str, port: int, timeout: float) -> LayerResult:
 
 
 async def tls_probe(ip: str, port: int, sni: str, timeout: float) -> LayerResult:
-    """真实 TLS 握手。SNI 阻断在 ClientHello 之后就会回 RST，这一步会失败。"""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     started = time.monotonic()
     writer: asyncio.StreamWriter | None = None
     try:
-        reader, writer = await asyncio.wait_for(
+        _reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port, ssl=ctx, server_hostname=sni or None), timeout
         )
-        elapsed = round((time.monotonic() - started) * 1000, 1)
         assert writer is not None
+        elapsed = round((time.monotonic() - started) * 1000, 1)
+        proto = ""
         try:
             ssl_obj = writer.get_extra_info("ssl_object")
-            version = ssl_obj.version() if ssl_obj else ""
+            proto = ssl_obj.version() if ssl_obj else ""
         except Exception:
-            version = ""
-        del reader
-        return LayerResult(LAYER_TLS, True, elapsed, detail=version or "")
+            proto = ""
+        return LayerResult(True, elapsed, detail=proto)
     except BaseException as exc:  # noqa: BLE001
-        kind = classify_exception(exc)
-        # TLS 阶段被重置/超时，常见是 SNI 关键字阻断
-        return LayerResult(
-            LAYER_TLS, False, None, kind, f"{type(exc).__name__}: {exc}"[:160]
-        )
+        return LayerResult(False, None, classify_exception(exc), f"{type(exc).__name__}: {exc}"[:160])
     finally:
         if writer is not None:
             writer.close()
@@ -230,7 +259,6 @@ async def tls_probe(ip: str, port: int, sni: str, timeout: float) -> LayerResult
 
 
 async def http_probe(ip: str, port: int, sni: str, path: str, timeout: float) -> LayerResult:
-    """TLS 之上发一个真实的 HTTP 请求，用来发现"握手能过、数据一过就断"。"""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -240,23 +268,21 @@ async def http_probe(ip: str, port: int, sni: str, path: str, timeout: float) ->
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port, ssl=ctx, server_hostname=sni or None), timeout
         )
+        assert writer is not None
         host = sni or ip
         request = (
             f"GET {path or '/'} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: eipguard\r\n"
             "Accept: */*\r\nConnection: close\r\n\r\n"
         )
-        assert writer is not None
         writer.write(request.encode())
         await writer.drain()
         data = await asyncio.wait_for(reader.read(64), timeout)
         elapsed = round((time.monotonic() - started) * 1000, 1)
         if data.startswith(b"HTTP/"):
-            return LayerResult(LAYER_HTTP, True, elapsed, detail=data.split(b"\r\n")[0].decode("latin1", "ignore"))
-        return LayerResult(LAYER_HTTP, False, elapsed, "http", f"非 HTTP 响应: {data[:40]!r}")
+            return LayerResult(True, elapsed, detail=data.split(b"\r\n")[0].decode("latin1", "ignore"))
+        return LayerResult(False, elapsed, "http", f"非 HTTP 响应: {data[:40]!r}")
     except BaseException as exc:  # noqa: BLE001
-        return LayerResult(
-            LAYER_HTTP, False, None, classify_exception(exc), f"{type(exc).__name__}: {exc}"[:160]
-        )
+        return LayerResult(False, None, classify_exception(exc), f"{type(exc).__name__}: {exc}"[:160])
     finally:
         if writer is not None:
             writer.close()
@@ -268,25 +294,25 @@ async def http_probe(ip: str, port: int, sni: str, path: str, timeout: float) ->
 
 # ---------------------------------------------------------------- 探针客户端
 class ProbeAgentClient:
-    """调用自建探针（probe_agent/server.py），拿回分层结果。"""
-
-    def __init__(self, agents: list[dict[str, Any]], timeout: float = 8.0, layers: list[str] | None = None,
-                 aux_ports: list[int] | None = None, http_path: str = "") -> None:
+    def __init__(
+        self,
+        agents: list[dict[str, Any]],
+        timeout: float = 8.0,
+        layers: list[str] | None = None,
+        http_path: str = "/",
+    ) -> None:
         self.agents = agents
         self.timeout = timeout
-        self.layers = list(layers or [LAYER_ICMP, LAYER_TCP, LAYER_TLS])
-        self.aux_ports = aux_ports or []
-        # 配了其它端口就必须真的去测，否则会误判成"整台 IP 被封"
-        if self.aux_ports and LAYER_AUX not in self.layers:
-            self.layers.append(LAYER_AUX)
+        self.layers = list(layers or ["icmp", "tls"])
         self.http_path = http_path
 
-    async def check(self, ip: str, port: int, *, sni: str = "", attempts: int = 2) -> list[NodeResult]:
+    async def check(self, ip: str, ports: list[int], *, sni: str = "", attempts: int = 2) -> list[NodeResult]:
         if not self.agents:
             return []
-        total = self.timeout * (len(self.layers) + len(self.aux_ports) + 2)
+        # 每个端口最坏要等 attempts 次超时
+        total = self.timeout * (len(ports) * attempts + 4) + 10
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=total)) as session:
-            tasks = [self._one(session, a, ip, port, sni, attempts) for a in self.agents]
+            tasks = [self._one(session, a, ip, ports, sni, attempts) for a in self.agents]
             return list(await asyncio.gather(*tasks))
 
     async def _one(
@@ -294,7 +320,7 @@ class ProbeAgentClient:
         session: aiohttp.ClientSession,
         agent: dict[str, Any],
         ip: str,
-        port: int,
+        ports: list[int],
         sni: str,
         attempts: int,
     ) -> NodeResult:
@@ -303,12 +329,12 @@ class ProbeAgentClient:
         zone = str(agent.get("zone") or "cn").lower()
         payload = {
             "ip": ip,
-            "port": port,
+            "ports": ports,
             "sni": sni,
             "attempts": attempts,
             "layers": self.layers,
-            "aux_ports": self.aux_ports,
             "http_path": self.http_path,
+            "timeout": self.timeout,
         }
         headers = {}
         if agent.get("token"):
@@ -317,30 +343,45 @@ class ProbeAgentClient:
             async with session.post(url, json=payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
                 if resp.status != 200:
-                    msg = ""
-                    if isinstance(data, dict):
-                        msg = str(data.get("error") or data.get("detail") or "")
+                    msg = str(data.get("error") or "") if isinstance(data, dict) else ""
                     return NodeResult(name, zone, error=f"HTTP {resp.status} {msg}".strip())
         except Exception as exc:  # noqa: BLE001
             return NodeResult(name, zone, error=f"{type(exc).__name__}: {exc}")
 
         if not isinstance(data, dict):
             return NodeResult(name, zone, error="探针返回非 JSON")
-        layers: dict[str, LayerResult] = {}
-        for layer, item in (data.get("layers") or {}).items():
+        # 配置没写 zone 时，用探针自报的位置（安装时 --zone 决定）
+        if not agent.get("zone") and data.get("zone") in {"cn", "overseas"}:
+            zone = str(data["zone"])
+
+        def layer(raw: Any) -> LayerResult | None:
+            if not isinstance(raw, dict):
+                return None
+            return LayerResult(
+                ok=raw.get("ok"),
+                ms=raw.get("ms"),
+                kind=str(raw.get("kind") or ""),
+                error=str(raw.get("error") or ""),
+                detail=str(raw.get("detail") or ""),
+            )
+
+        icmp = layer(data.get("icmp"))
+        result: dict[int, PortProbe] = {}
+        raw_ports = data.get("ports") or {}
+        for key, item in raw_ports.items():
             if not isinstance(item, dict):
                 continue
-            layers[str(layer)] = LayerResult(
-                layer=str(layer),
-                ok=item.get("ok"),
-                ms=item.get("ms"),
-                kind=str(item.get("kind") or ""),
-                error=str(item.get("error") or ""),
-                detail=str(item.get("detail") or ""),
-            )
-        if not layers:
-            return NodeResult(name, zone, error="探针没有返回分层结果")
-        return NodeResult(name, zone, layers)
+            try:
+                port = int(key)
+            except (TypeError, ValueError):
+                continue
+            tcp = layer(item.get("tcp"))
+            if tcp is None:
+                continue
+            result[port] = PortProbe(port, tcp, layer(item.get("tls")), layer(item.get("http")))
+        if not result:
+            return NodeResult(name, zone, icmp, error="探针没有返回端口结果")
+        return NodeResult(name, zone, icmp, result)
 
 
 # ---------------------------------------------------------------- check-host.net
@@ -348,10 +389,9 @@ CHECKHOST_API = "https://check-host.net"
 
 
 class CheckHostClient:
-    """免费公共探测网络。只有 TCP 和 ICMP 两层，没有 TLS，判端口/整机够用。"""
+    """免费公共探测网。只能测单端口，但节点里常有中国的，适合做交叉验证。"""
 
-    def __init__(self, port: int = 443, nodes: int = 6, timeout: int = 20) -> None:
-        self.port = port
+    def __init__(self, nodes: int = 6, timeout: int = 20) -> None:
         self.nodes = nodes
         self.timeout = timeout
 
@@ -359,8 +399,7 @@ class CheckHostClient:
         nodes_meta: dict[str, str] = {}
         try:
             async with session.get(
-                f"{CHECKHOST_API}/check-{kind}",
-                params={"host": target, "max_nodes": self.nodes},
+                f"{CHECKHOST_API}/check-{kind}", params={"host": target, "max_nodes": self.nodes}
             ) as resp:
                 data = await resp.json(content_type=None)
         except Exception:
@@ -369,9 +408,7 @@ class CheckHostClient:
             return {}, {}
         request_id = str(data.get("request_id") or "")
         for name, meta in (data.get("nodes") or {}).items():
-            country = ""
-            if isinstance(meta, list) and meta:
-                country = str(meta[0] or "").lower()
+            country = str(meta[0] if isinstance(meta, list) and meta else "").lower()
             nodes_meta[str(name)] = country
         if not request_id:
             return {}, nodes_meta
@@ -387,44 +424,43 @@ class CheckHostClient:
                 break
         return result, nodes_meta
 
-    async def check(self, ip: str, port: int, **_: Any) -> list[NodeResult]:
+    async def check(self, ip: str, ports: list[int], **_: Any) -> list[NodeResult]:
+        port = ports[0] if ports else 443
         headers = {"Accept": "application/json", "User-Agent": "eipguard/1.0"}
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.timeout * 2 + 20), headers=headers
+            timeout=aiohttp.ClientTimeout(total=self.timeout * 2 + 25), headers=headers
         ) as session:
-            tcp_result, nodes_meta = await self._run(session, "tcp", f"{ip}:{port or self.port}")
+            tcp_result, nodes_meta = await self._run(session, "tcp", f"{ip}:{port}")
             icmp_result, icmp_meta = await self._run(session, "ping", ip)
             nodes_meta.update({k: v for k, v in icmp_meta.items() if k not in nodes_meta})
 
         out: list[NodeResult] = []
-        names = set(tcp_result) | set(icmp_result)
-        for name in names:
+        for name in set(tcp_result) | set(icmp_result):
             country = nodes_meta.get(name, "")
             zone = "cn" if country == "cn" else ("overseas" if country else "unknown")
-            layers: dict[str, LayerResult] = {}
-
+            probes: dict[int, PortProbe] = {}
             tcp_value = tcp_result.get(name)
             if tcp_value is not None:
-                layers[LAYER_TCP] = self._layer_from(tcp_value, LAYER_TCP)
+                probes[port] = PortProbe(port, self._layer(tcp_value))
             icmp_value = icmp_result.get(name)
-            if icmp_value is not None:
-                layers[LAYER_ICMP] = self._layer_from(icmp_value, LAYER_ICMP)
-            out.append(NodeResult(name, zone, layers))
+            icmp = self._layer(icmp_value) if icmp_value is not None else None
+            out.append(NodeResult(name, zone, icmp, probes))
         if not out:
             out.append(NodeResult("check-host", "unknown", error="check-host 无结果"))
         return out
 
     @staticmethod
-    def _layer_from(value: Any, layer: str) -> LayerResult:
+    def _layer(value: Any) -> LayerResult:
         if isinstance(value, dict) and value.get("error"):
-            return LayerResult(layer, False, kind="other", error=str(value["error"]))
+            return LayerResult(False, kind="other", error=str(value["error"]))
         entries = value if isinstance(value, list) else [value]
         ok = False
         ms: float | None = None
         for entry in entries:
             if isinstance(entry, dict):
                 ok = True
-                ms = round(float(entry.get("time") or 0) * 1000, 1) if entry.get("time") else ms
+                if entry.get("time"):
+                    ms = round(float(entry["time"]) * 1000, 1)
             elif isinstance(entry, list) and entry:
                 ok = True
                 try:
@@ -432,8 +468,8 @@ class CheckHostClient:
                 except (TypeError, ValueError):
                     pass
         if not entries:
-            return LayerResult(layer, False, kind="other", error="无数据")
-        return LayerResult(layer, ok, ms, "" if ok else "timeout")
+            return LayerResult(False, kind="other", error="无数据")
+        return LayerResult(ok, ms, "" if ok else "timeout")
 
 
 # ---------------------------------------------------------------- 结论合成
@@ -443,10 +479,14 @@ class ProbeOutcome:
     reason: str
     nodes: list[NodeResult] = field(default_factory=list)
     advice: str = ""
+    ports: list[PortState] = field(default_factory=list)
+    node_port: int = 443
+    icmp_cn: str = "untested"
+    icmp_os: str = "untested"
 
     @property
     def ok(self) -> bool:
-        return self.verdict in (Verdict.OK, Verdict.DEGRADED)
+        return self.verdict is Verdict.OK
 
     @property
     def blocked(self) -> bool:
@@ -469,163 +509,176 @@ class ProbeOutcome:
             "verdict": self.verdict.value,
             "reason": self.reason,
             "advice": self.advice,
-            "nodes": [
-                {"node": n.node, "zone": n.zone, "summary": n.summary(), "error": n.error}
-                for n in self.nodes
-            ],
+            "node_port": self.node_port,
+            "ports": [{"port": p.port, "cn": p.cn, "os": p.os} for p in self.ports],
+            "nodes": [{"node": n.node, "zone": n.zone, "summary": n.brief(), "error": n.error} for n in self.nodes],
         }
 
 
-def _side(nodes: list[NodeResult], zone: str) -> list[NodeResult]:
-    return [n for n in nodes if (n.zone == "cn") if zone == "cn"] if zone == "cn" else [
-        n for n in nodes if n.zone != "cn"
-    ]
+def _side(nodes: list[NodeResult], side: str) -> list[NodeResult]:
+    if side == "cn":
+        return [n for n in nodes if n.zone == "cn"]
+    return [n for n in nodes if n.zone != "cn"]
 
 
-def _state(nodes: list[NodeResult], layer: str, fail_ratio: float) -> str:
-    """返回 ok / fail / untested（同侧多节点按失败比例投票）。"""
-    tested = [
-        n.layers[layer]
-        for n in nodes
-        if layer in n.layers and n.layers[layer].ok is not None
-    ]
+def _port_state(nodes: list[NodeResult], port: int, fail_ratio: float) -> tuple[str, str]:
+    """返回 (state, kind)。state ∈ ok / fail / untested。"""
+    tested = [n.ports[port].tcp for n in nodes if port in n.ports and n.ports[port].tcp.ok is not None]
+    if not tested:
+        return "untested", ""
+    ok_count = sum(1 for item in tested if item.ok)
+    fail_ratio_actual = 1 - ok_count / len(tested)
+    kinds = sorted({item.kind for item in tested if item.kind})
+    kind = "/".join(kinds)
+    if fail_ratio_actual >= fail_ratio:
+        return "fail", kind
+    return "ok", ""
+
+
+def _icmp_state(nodes: list[NodeResult], fail_ratio: float) -> str:
+    tested = [n.icmp for n in nodes if n.icmp is not None and n.icmp.ok is not None]
     if not tested:
         return "untested"
     ok_ratio = sum(1 for item in tested if item.ok) / len(tested)
     return "ok" if ok_ratio >= 1 - fail_ratio else "fail"
 
 
-def _kinds(nodes: list[NodeResult], layer: str) -> str:
-    kinds = sorted({n.layers[layer].kind for n in nodes if layer in n.layers and n.layers[layer].kind})
-    return "/".join(kinds)
-
-
 def judge(
     nodes: list[NodeResult],
     *,
-    port: int = 443,
-    aux_ports: list[int] | None = None,
+    ports: list[int] | None = None,
     fail_ratio: float = 0.6,
-    min_samples: int = 1,
 ) -> ProbeOutcome:
-    """把分层结果合成一个明确结论。
+    """同一端口国内外对比，得出结论。
 
-    判定表（墙内 vs 墙外）：
-      ICMP   TCP(节点端口)  其它端口   TLS       墙外       结论
-      ✗/✓    ✗            ✗        -         ✓         IP 被墙（ICMP 可能被放行来迷惑你）
-      ✓      ✗            ✓        -         ✓         端口被墙（换 IP 没用，换端口）
-      ✓      ✓            -        ✗         ✓         TLS 被阻断（SNI/指纹，换 IP 没用）
-      ✓      ✓            -        ✓         ✓         正常
-      -      ✗            -        -         ✗         服务故障，不是墙
-      -      -            -        -         -         无法判定（缺墙内探针）
+    规则（node_port 指 target 的探测端口，其余为辅助端口）：
+      node_port 国内通                        → OK（再看 TLS/HTTP）
+      node_port 国内不通 + 国外通              → 被墙
+          同 IP 有其它端口国内通              → PORT_BLOCKED（换端口）
+          同 IP 其它端口国内都不通/没测        → IP_BLOCKED（换 IP）
+      node_port 国内不通 + 国外也不通          → SERVICE_DOWN（不是墙）
+      缺国内或国外节点                        → UNKNOWN
     """
+    ports = ports or sorted({p for n in nodes for p in n.ports}) or [443]
+    node_port = ports[0]
+
     if not nodes:
-        return ProbeOutcome(Verdict.UNKNOWN, "没有可用的探测节点", nodes, VERDICT_ADVICE[Verdict.UNKNOWN])
+        return ProbeOutcome(Verdict.UNKNOWN, "没有可用的探测节点", nodes, VERDICT_ADVICE[Verdict.UNKNOWN], node_port=node_port)
 
     cn = _side(nodes, "cn")
     outside = _side(nodes, "overseas")
     summary = " | ".join(n.brief() for n in nodes)
 
-    os_tcp = _state(outside, LAYER_TCP, fail_ratio)
-    os_tls = _state(outside, LAYER_TLS, fail_ratio)
-    os_http = _state(outside, LAYER_HTTP, fail_ratio)
+    states: list[PortState] = []
+    for port in ports:
+        cn_state, cn_kind = _port_state(cn, port, fail_ratio) if cn else ("untested", "")
+        os_state, os_kind = _port_state(outside, port, fail_ratio) if outside else ("untested", "")
+        states.append(PortState(port, cn_state, os_state, cn_kind, os_kind))
+    by_port = {item.port: item for item in states}
+    main = by_port[node_port]
 
-    # 1) 墙外自己都不通 → 实例/服务故障，绝不换 IP
-    if outside and os_tcp == "fail":
+    icmp_cn = _icmp_state(cn, fail_ratio) if cn else "untested"
+    icmp_os = _icmp_state(outside, fail_ratio) if outside else "untested"
+    matrix = "；".join(item.line() for item in states)
+
+    def outcome(verdict: Verdict, reason: str) -> ProbeOutcome:
         return ProbeOutcome(
-            Verdict.DOWN,
-            f"墙外节点也连不上节点端口，判定为服务/实例故障，不是墙：{summary}",
-            nodes,
-            VERDICT_ADVICE[Verdict.DOWN],
+            verdict, reason, nodes, VERDICT_ADVICE[verdict], states, node_port, icmp_cn, icmp_os
         )
 
     if not cn:
-        # 只有墙外数据：可以判断"活着"，但无法区分被墙
-        if os_tcp == "fail":
-            return ProbeOutcome(
-                Verdict.DOWN, f"墙外也不通，服务可能挂了：{summary}", nodes, VERDICT_ADVICE[Verdict.DOWN]
-            )
-        return ProbeOutcome(
+        return outcome(
             Verdict.UNKNOWN,
-            f"缺少墙内探针（zone: cn），只能确认墙外可达，无法判定是否被墙：{summary}",
-            nodes,
-            VERDICT_ADVICE[Verdict.UNKNOWN],
+            f"没有国内探针（zone: cn），无法做「国内不通 vs 国外通」的对比：{summary}",
+        )
+    if not outside:
+        return outcome(
+            Verdict.UNKNOWN,
+            f"没有国外探针（zone: overseas），无法确认端口在墙外是否正常：{summary}",
         )
 
-    cn_tcp = _state(cn, LAYER_TCP, fail_ratio)
-    cn_tls = _state(cn, LAYER_TLS, fail_ratio)
-    cn_http = _state(cn, LAYER_HTTP, fail_ratio)
-    cn_aux = _state(cn, LAYER_AUX, fail_ratio)
-    cn_icmp = _state(cn, LAYER_ICMP, fail_ratio)
-
-    # 2) 节点端口能建连
-    if cn_tcp == "ok":
-        if cn_tls == "fail" and os_tls != "fail":
-            kinds = _kinds(cn, LAYER_TLS)
-            return ProbeOutcome(
+    # 1) 国内能连上节点端口
+    if main.cn == "ok":
+        cn_tls = _aggregate_layer(cn, node_port, "tls", fail_ratio)
+        os_tls = _aggregate_layer(outside, node_port, "tls", fail_ratio)
+        cn_http = _aggregate_layer(cn, node_port, "http", fail_ratio)
+        os_http = _aggregate_layer(outside, node_port, "http", fail_ratio)
+        if cn_tls == "fail" and os_tls == "fail":
+            # 两边 TLS 都失败：证书/协议配置有问题，不是墙
+            return outcome(
+                Verdict.SERVICE_DOWN,
+                f"TCP 能连上，但国内外 TLS 握手都失败 → 是证书/协议配置问题，不是墙：{summary}",
+            )
+        if cn_tls == "fail" and os_tls == "ok":
+            return outcome(
                 Verdict.TLS_BLOCKED,
-                f"TCP 能连上但 TLS 握手{'被重置' if 'reset' in kinds else '失败'}，墙外 TLS 正常 → "
-                f"按 SNI/指纹阻断：{summary}",
-                nodes,
-                VERDICT_ADVICE[Verdict.TLS_BLOCKED],
+                f"国内 TCP 能连上，但 TLS 握手被重置/超时，国外 TLS 正常 → 按 SNI/证书指纹阻断：{summary}",
             )
         if cn_http == "fail" and os_http == "ok":
-            return ProbeOutcome(
+            return outcome(
                 Verdict.DATA_BLOCKED,
-                f"TCP 与 TLS 都正常，但 HTTP 数据请求被断，墙外正常 → 数据面被阻断：{summary}",
-                nodes,
-                VERDICT_ADVICE[Verdict.DATA_BLOCKED],
+                f"国内 TCP 与 TLS 都正常，但真实 HTTP 请求被断，国外正常 → 数据面被阻断：{summary}",
             )
-        if cn_tls == "untested" and cn_http == "untested":
-            return ProbeOutcome(Verdict.OK, f"节点端口 TCP 可达（未测 TLS）：{summary}", nodes)
-        return ProbeOutcome(Verdict.OK, f"探测正常：{summary}", nodes)
+        return outcome(Verdict.OK, f"国内可正常连通节点端口 {node_port}：{summary}")
 
-    # 3) 节点端口不通：先看是不是只有这个端口
-    if cn_aux == "ok":
-        aux_detail = next(
-            (n.layers[LAYER_AUX].detail for n in cn if n.layers.get(LAYER_AUX) and n.layers[LAYER_AUX].detail),
-            "",
+    # 2) 国内连不上，且国外也连不上 → 不是墙
+    if main.os == "fail":
+        return outcome(
+            Verdict.SERVICE_DOWN,
+            f"端口 {node_port} 在国内和国外都连不上 → 不是墙，是服务没起/安全组没放行/"
+            f"服务器防火墙挡住（{main.os_kind or '连接失败'}）。换 IP 无效：{summary}",
         )
-        return ProbeOutcome(
+
+    # 3) 国内连不上，国外能连 → 这个端口被墙
+    if main.os == "untested":
+        return outcome(
+            Verdict.UNKNOWN,
+            f"国内连不上端口 {node_port}，但国外节点没有该端口的结果，无法确认是否被墙：{summary}",
+        )
+
+    reachable_others = [item.port for item in states if item.port != node_port and item.cn == "ok"]
+    blocked_others = [item.port for item in states if item.port != node_port and item.blocked]
+    broken_others = [item.port for item in states if item.port != node_port and item.os == "fail"]
+    untested = [item.port for item in states if item.port != node_port and item.cn == "untested"]
+
+    if reachable_others:
+        return outcome(
             Verdict.PORT_BLOCKED,
-            f"节点端口 {port} 不通，但其它端口（{aux_detail or 'aux'}）可连，墙外节点端口正常 → "
-            f"仅端口被封：{summary}",
-            nodes,
-            VERDICT_ADVICE[Verdict.PORT_BLOCKED],
+            f"端口 {node_port} 国内不通、国外正常，但同 IP 的 {', '.join(map(str, reachable_others))} "
+            f"国内能连 → 只封了这一个端口：{matrix}",
         )
-
-    # 4) 所有端口都不通
-    aux_note = "" if cn_aux != "untested" else "（未配置 aux_ports，没测其它端口）"
-    if cn_icmp == "ok":
-        return ProbeOutcome(
+    if blocked_others:
+        return outcome(
             Verdict.IP_BLOCKED,
-            f"ICMP 能通但 {port} 和其它测试端口全部不通{aux_note}，墙外正常 → IP 被墙"
-            f"（ICMP 被放行是常见假象，不代表 IP 可用）：{summary}",
-            nodes,
-            VERDICT_ADVICE[Verdict.IP_BLOCKED],
+            f"端口 {node_port} 与 {', '.join(map(str, blocked_others))} 国内都不通、国外都正常 → "
+            f"整台 IP 被墙：{matrix}",
         )
-    if cn_icmp == "fail":
-        return ProbeOutcome(
+    if untested and not broken_others:
+        return outcome(
             Verdict.IP_BLOCKED,
-            f"ICMP 和 TCP 全部不通，墙外正常 → IP 被墙：{summary}",
-            nodes,
-            VERDICT_ADVICE[Verdict.IP_BLOCKED],
+            f"端口 {node_port} 国内不通、国外正常（其它端口 {', '.join(map(str, untested))} 未测到，"
+            f"建议在目标上配置 aux_ports 以便区分「整机被封」和「只封端口」）：{matrix}",
         )
-    # ICMP 没测（探针没 ping 权限）但 TCP 全不通
-    if cn_aux == "untested":
-        return ProbeOutcome(
-            Verdict.IP_BLOCKED,
-            f"节点端口不通、墙外正常，且探针未测其它端口/ICMP（建议开启 aux_ports 提高准确度）→ "
-            f"按 IP 被墙处理：{summary}",
-            nodes,
-            VERDICT_ADVICE[Verdict.IP_BLOCKED],
-        )
-    return ProbeOutcome(
+    note = f"（{', '.join(map(str, broken_others))} 在国内外都不通，属于服务本身问题，不影响结论）" if broken_others else ""
+    return outcome(
         Verdict.IP_BLOCKED,
-        f"ICMP 未测，TCP 全部不通，墙外正常 → IP 被墙：{summary}",
-        nodes,
-        VERDICT_ADVICE[Verdict.IP_BLOCKED],
+        f"端口 {node_port} 国内不通、国外正常，同 IP 其它端口也没有国内可达的{note} → 判定 IP 被墙：{matrix}",
     )
+
+
+def _aggregate_layer(nodes: list[NodeResult], port: int, name: str, fail_ratio: float) -> str:
+    tested = []
+    for node in nodes:
+        probe = node.ports.get(port)
+        if not probe:
+            continue
+        item = getattr(probe, name, None)
+        if item is not None and item.ok is not None:
+            tested.append(item)
+    if not tested:
+        return "untested"
+    ok_ratio = sum(1 for item in tested if item.ok) / len(tested)
+    return "ok" if ok_ratio >= 1 - fail_ratio else "fail"
 
 
 # ---------------------------------------------------------------- 探测器
@@ -645,7 +698,7 @@ class Detector:
     def __init__(self, cfg: DetectConfig) -> None:
         self.cfg = cfg
 
-    async def check(self, ip: str, port: int, *, sni: str = "") -> ProbeOutcome:
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
         raise NotImplementedError
 
     async def close(self) -> None:
@@ -657,23 +710,11 @@ class ProbeAgentDetector(Detector):
 
     def __init__(self, cfg: DetectConfig) -> None:
         super().__init__(cfg)
-        self.client = ProbeAgentClient(
-            cfg.probe_agents,
-            timeout=cfg.timeout,
-            layers=cfg.layers,
-            aux_ports=cfg.aux_ports,
-            http_path=cfg.http_path,
-        )
+        self.client = ProbeAgentClient(cfg.probe_agents, cfg.timeout, cfg.layers, cfg.http_path)
 
-    async def check(self, ip: str, port: int, *, sni: str = "") -> ProbeOutcome:
-        nodes = await self.client.check(ip, port, sni=sni, attempts=self.cfg.attempts)
-        return judge(
-            nodes,
-            port=port,
-            aux_ports=self.cfg.aux_ports,
-            fail_ratio=self.cfg.fail_ratio,
-            min_samples=self.cfg.min_samples,
-        )
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
+        nodes = await self.client.check(ip, ports, sni=sni, attempts=self.cfg.attempts)
+        return judge(nodes, ports=ports, fail_ratio=self.cfg.fail_ratio)
 
 
 class CheckHostDetector(Detector):
@@ -681,54 +722,41 @@ class CheckHostDetector(Detector):
 
     def __init__(self, cfg: DetectConfig) -> None:
         super().__init__(cfg)
-        self.client = CheckHostClient(nodes=cfg.checkhost_max_nodes, timeout=cfg.checkhost_timeout)
+        self.client = CheckHostClient(cfg.checkhost_max_nodes, cfg.checkhost_timeout)
 
-    async def check(self, ip: str, port: int, *, sni: str = "") -> ProbeOutcome:
-        nodes = await self.client.check(ip, port)
-        return judge(nodes, port=port, aux_ports=[], fail_ratio=self.cfg.fail_ratio)
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
+        nodes = await self.client.check(ip, ports)
+        return judge(nodes, ports=ports[:1], fail_ratio=self.cfg.fail_ratio)
 
 
 class SelfDetector(Detector):
-    """从本机直接探测（机器人跑在墙内时可用）。墙内视角，没有墙外确认。"""
+    """仅本机视角：能证明"通"，不能证明"被墙"。"""
 
     name = "tcp_self"
 
-    async def check(self, ip: str, port: int, *, sni: str = "") -> ProbeOutcome:
-        layers: dict[str, LayerResult] = {}
-        if LAYER_ICMP in self.cfg.layers:
-            layers[LAYER_ICMP] = await icmp_probe(ip, count=2, timeout=self.cfg.timeout)
-        tcp = await tcp_probe(ip, port, self.cfg.timeout)
-        tcp.layer = LAYER_TCP
-        layers[LAYER_TCP] = tcp
-        if tcp.ok and LAYER_TLS in self.cfg.layers and sni:
-            tls = await tls_probe(ip, port, sni, self.cfg.timeout)
-            layers[LAYER_TLS] = tls
-        if tcp.ok and LAYER_HTTP in self.cfg.layers and sni and self.cfg.http_path:
-            layers[LAYER_HTTP] = await http_probe(ip, port, sni, self.cfg.http_path, self.cfg.timeout)
-
-        node = NodeResult("self", "cn", layers)
-        # 本机就是墙内，墙外不可见：只能对"能通"下结论，否者交给 wall 侧确认
-        tcp_state = _state([node], LAYER_TCP, 1.0)
-        tls_state = _state([node], LAYER_TLS, 1.0)
-        if tcp_state == "ok" and tls_state in ("ok", "untested"):
-            return ProbeOutcome(Verdict.OK, f"本机探测正常：{node.brief()}", [node])
-        if tcp_state == "ok" and tls_state == "fail":
-            return ProbeOutcome(
-                Verdict.TLS_BLOCKED,
-                f"本机 TCP 通但 TLS 失败（无墙外对照，可能只是服务配置问题）：{node.brief()}",
-                [node],
-                VERDICT_ADVICE[Verdict.TLS_BLOCKED],
-            )
-        return ProbeOutcome(
-            Verdict.UNKNOWN,
-            f"本机连不上，但没有墙外节点确认，无法区分被墙/故障：{node.brief()}",
-            [node],
-            VERDICT_ADVICE[Verdict.UNKNOWN],
-        )
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
+        probes: dict[int, PortProbe] = {}
+        for index, port in enumerate(ports):
+            tcp = await tcp_probe(ip, port, self.cfg.timeout)
+            probe = PortProbe(port, tcp)
+            if index == 0 and tcp.ok:
+                if "tls" in self.cfg.layers and sni:
+                    probe.tls = await tls_probe(ip, port, sni, self.cfg.timeout)
+                if "http" in self.cfg.layers and sni and self.cfg.http_path:
+                    probe.http = await http_probe(ip, port, sni, self.cfg.http_path, self.cfg.timeout)
+            probes[port] = probe
+        icmp = await icmp_probe(ip, 1, self.cfg.timeout) if "icmp" in self.cfg.layers else None
+        node = NodeResult("self", "cn", icmp, probes)
+        outcome = judge([node], ports=ports, fail_ratio=1.0)
+        if outcome.verdict is Verdict.UNKNOWN and node.tcp_ok(ports[0]):
+            return ProbeOutcome(Verdict.OK, f"本机可连通端口 {ports[0]}：{node.brief()}", [node], "", node_port=ports[0])
+        if outcome.verdict is Verdict.UNKNOWN:
+            outcome.reason = f"本机连不上，但没有国外节点对比，无法区分被墙/服务故障：{node.brief()}"
+        return outcome
 
 
 class HybridDetector(Detector):
-    """自建探针 + check-host，任一给出阻塞结论即采用。"""
+    """自建探针为主，check-host 交叉验证。"""
 
     name = "hybrid"
 
@@ -739,20 +767,19 @@ class HybridDetector(Detector):
             self.parts.append(ProbeAgentDetector(cfg))
         self.parts.append(CheckHostDetector(cfg))
 
-    async def check(self, ip: str, port: int, *, sni: str = "") -> ProbeOutcome:
-        results = list(await asyncio.gather(*(p.check(ip, port, sni=sni) for p in self.parts)))
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
+        results = list(await asyncio.gather(*(p.check(ip, ports, sni=sni) for p in self.parts)))
         nodes = [n for r in results for n in r.nodes]
-        # 自建探针的结论最可信，优先用它
         primary = results[0]
-        if primary.verdict in BLOCKING_VERDICTS or primary.verdict == Verdict.OK:
+        if primary.verdict in BLOCKING_VERDICTS or primary.verdict in (Verdict.OK, Verdict.SERVICE_DOWN):
             primary.nodes = nodes
             primary.reason = " || ".join(f"[{p.name}] {r.reason}" for p, r in zip(self.parts, results))
             return primary
-        blocked = [r for r in results if r.verdict in BLOCKING_VERDICTS]
-        if blocked:
-            blocked[0].nodes = nodes
-            blocked[0].reason = " || ".join(f"[{p.name}] {r.reason}" for p, r in zip(self.parts, results))
-            return blocked[0]
+        for result in results:
+            if result.verdict in BLOCKING_VERDICTS:
+                result.nodes = nodes
+                result.reason = " || ".join(f"[{p.name}] {r.reason}" for p, r in zip(self.parts, results))
+                return result
         primary.nodes = nodes
         primary.reason = " || ".join(f"[{p.name}] {r.reason}" for p, r in zip(self.parts, results))
         return primary

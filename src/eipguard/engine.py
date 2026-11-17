@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from . import fmt
 from .cloud.aliyun import AliyunError, AliyunVpc, EipInfo
 from .cloud.cloudflare import Cloudflare, CloudflareError
 from .config import Config, TargetConfig
@@ -15,6 +16,22 @@ from .state import Settings, StateStore, TargetState
 log = logging.getLogger(__name__)
 
 Notifier = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def pingpe_link(target: TargetConfig, ip: str, default_port: int = 443) -> str:
+    """生成 ping.pe 自查链接（人工复核用）。
+
+    ping.pe 的格式：https://ping.pe/1.2.3.4 或 https://ping.pe/1.2.3.4:443
+    带上域名（target.dns_records[0]）时用 TCP 检测，能看到国内外逐项结果，
+    正好和本项目自动判定的是同一套逻辑。
+    """
+    if not ip:
+        return ""
+    port = target.probe_port or default_port
+    base = f"https://ping.pe/{ip}" if not port else f"https://ping.pe/{ip}:{port}"
+    if target.dns_records:
+        return f"{base}?host={target.dns_records[0]}"
+    return base
 
 
 @dataclass
@@ -48,6 +65,7 @@ class Engine:
         *,
         notifier: Notifier | None = None,
         aliyun: AliyunVpc | None = None,
+        aliyun_accounts: dict[str, AliyunVpc] | None = None,
         cloudflare: Cloudflare | None = None,
         detector: Detector | None = None,
     ) -> None:
@@ -55,13 +73,22 @@ class Engine:
         self.store = store
         self.settings = settings
         self.notify = notifier
-        self.aliyun = aliyun or AliyunVpc(
-            cfg.aliyun.access_key_id,
-            cfg.aliyun.access_key_secret,
-            cfg.aliyun.region_id,
-            cfg.aliyun.endpoint,
-            cfg.aliyun.api_version,
-        )
+        # 多账号：每个阿里云账号一个客户端
+        if aliyun_accounts:
+            self.aliyuns = aliyun_accounts
+        elif aliyun is not None:
+            self.aliyuns = {name: aliyun for name in cfg.aliyun.accounts} or {"default": aliyun}
+        else:
+            self.aliyuns = {
+                name: AliyunVpc(
+                    account.access_key_id,
+                    account.access_key_secret,
+                    account.default_region,
+                    account.endpoint,
+                    account.api_version,
+                )
+                for name, account in cfg.aliyun.accounts.items()
+            }
         self.cloudflare = cloudflare or Cloudflare(
             cfg.cloudflare.api_token,
             zone_id=cfg.cloudflare.zone_id,
@@ -79,6 +106,18 @@ class Engine:
     # ------------------------------------------------------------------ utils
     def lock(self, name: str) -> asyncio.Lock:
         return self._locks.setdefault(name, asyncio.Lock())
+
+    def aliyun_for(self, target: TargetConfig) -> AliyunVpc:
+        client = self.aliyuns.get(target.account) or self.aliyuns.get("default")
+        if client is None:
+            raise AliyunError("AliyunClient", "NoAccount", f"没有可用于账号 {target.account} 的客户端")
+        return client
+
+    def region_for(self, target: TargetConfig) -> str:
+        if target.region_id:
+            return target.region_id
+        account = self.cfg.aliyun.accounts.get(target.account)
+        return account.default_region if account else self.cfg.aliyun.region_id
 
     def target_state(self, name: str) -> TargetState:
         return self.store.get(name)
@@ -107,23 +146,22 @@ class Engine:
                 log.exception("通知发送失败")
 
     async def resolve_eip(self, target: TargetConfig) -> EipInfo | None:
-        region = target.region_id or self.cfg.aliyun.region_id
+        client = self.aliyun_for(target)
+        region = self.region_for(target)
         if target.eip_allocation_id:
-            info = await self.aliyun.get_eip(target.eip_allocation_id, region_id=region)
+            info = await client.get_eip(target.eip_allocation_id, region_id=region)
             if info:
                 return info
-        return await self.aliyun.find_instance_eip(target.instance_id, region_id=region)
+        return await client.find_instance_eip(target.instance_id, region_id=region)
 
-    async def _probe(self, ip: str, port: int, names: list[str], sni: str = "") -> ProbeOutcome:
-        # 优先用目标上的域名做 SNI（TLS 层需要），没配域名再用配置里的 sni
-        server_name = sni or self.cfg.detect.sni or (names[0] if names else "")
-        return await self.detector.check(ip, port, sni=server_name)
+    async def _probe(self, target: TargetConfig, ip: str) -> ProbeOutcome:
+        sni = target.dns_records[0] if target.dns_records else ""
+        ports = target.all_ports(self.cfg.detect.port)
+        return await self.detector.check(ip, ports, sni=sni)
 
-    async def probe_once(
-        self, ip: str, port: int, names: list[str] | None = None, sni: str = ""
-    ) -> ProbeOutcome:
+    async def probe_once(self, ip: str, ports: list[int], sni: str = "") -> ProbeOutcome:
         """对外暴露的一次探测（机器人 /health 使用）。"""
-        return await self._probe(ip, port, names or [], sni)
+        return await self.detector.check(ip, ports, sni=sni)
 
     # ------------------------------------------------------------------ status
     async def inspect(self, name: str) -> dict[str, Any]:
@@ -145,7 +183,7 @@ class Engine:
         state.current_ip = eip.ip
         state.allocation_id = eip.allocation_id
         try:
-            probe = await self._probe(eip.ip, target.probe_port or self.cfg.detect.port, target.dns_records)
+            probe = await self._probe(target, eip.ip)
         except Exception as exc:  # noqa: BLE001 - 探测服务异常不能当作被墙
             log.warning("%s 探测异常：%s", name, exc)
             return {"target": target, "state": state, "eip": eip, "probe": None, "error": f"探测异常：{exc}"}
@@ -232,7 +270,7 @@ class Engine:
             self.store.save()
             auto_on = self.auto_enabled(name)
             if not switchable:
-                kind = "service_down" if probe.verdict is Verdict.DOWN else "block_other"
+                kind = "service_down" if probe.verdict is Verdict.SERVICE_DOWN else "block_other"
             elif confirmed and not auto_on:
                 kind = "auto_disabled"
             else:
@@ -242,9 +280,12 @@ class Engine:
                     "type": kind,
                     "target": name,
                     "ip": state.current_ip,
+                    "account": target.account,
                     "verdict": probe.verdict.value,
                     "label": probe.label,
                     "advice": probe.advice,
+                    "matrix": fmt.matrix_text(probe),
+                    "pingpe": pingpe_link(target, state.current_ip),
                     "count": state.failures,
                     "threshold": self.settings.failure_threshold,
                     "detail": probe.reason,
@@ -288,7 +329,7 @@ class Engine:
         result = SwitchResult(ok=False, target=name, manual=manual, dry_run=dry_run)
         target = self.cfg.target(name)
         state = self.target_state(name)
-        region = target.region_id or self.cfg.aliyun.region_id
+        region = self.region_for(target)
         lock = self.lock(name)
         if lock.locked() and not force:
             result.error = "该目标正在处理中，请稍后再试"
@@ -316,6 +357,7 @@ class Engine:
         reason: str,
     ) -> SwitchResult:
         name = target.name
+        client = self.aliyun_for(target)
         old: EipInfo | None = None
         try:
             old = await self.resolve_eip(target)
@@ -341,7 +383,7 @@ class Engine:
             result.step("演练模式：跳过分配与解析")
             return result
 
-        probe = probe or await self._probe(old.ip, target.probe_port or self.cfg.detect.port, target.dns_records)
+        probe = probe or await self._probe(target, old.ip)
         result.verify = probe
         result.step(f"探测结论：{probe.reason}")
 
@@ -370,26 +412,26 @@ class Engine:
             new: EipInfo | None = None
             try:
                 result.step(f"第 {attempt}/{self.cfg.switch.max_attempts} 次尝试：分配新 EIP")
-                new = await self.aliyun.allocate_eip(**allocate_kwargs)
+                new = await client.allocate_eip(**allocate_kwargs)
                 result.new_ip = new.ip
                 result.new_allocation_id = new.allocation_id
                 result.step(f"新 EIP {new.ip} ({new.allocation_id})")
 
-                await self._wait_available(new.allocation_id, region)
+                await self._wait_available(client, new.allocation_id, region)
 
-                live_old = await self.aliyun.get_eip(old.allocation_id, region_id=region)
+                live_old = await client.get_eip(old.allocation_id, region_id=region)
                 if live_old and live_old.bound:
                     result.step("解绑旧 EIP")
-                    await self.aliyun.unassociate(
+                    await client.unassociate(
                         old.allocation_id,
                         live_old.instance_id or old.instance_id or target.instance_id,
                         region_id=region,
                     )
-                    await self.aliyun.wait_status(old.allocation_id, {"Available"}, timeout=60, region_id=region)
+                    await client.wait_status(old.allocation_id, {"Available"}, timeout=60, region_id=region)
 
                 result.step(f"绑定新 EIP 到 {target.instance_id}")
-                await self.aliyun.associate(new.allocation_id, target.instance_id, region_id=region)
-                await self.aliyun.wait_status(new.allocation_id, {"InUse"}, timeout=90, region_id=region)
+                await client.associate(new.allocation_id, target.instance_id, region_id=region)
+                await client.wait_status(new.allocation_id, {"InUse"}, timeout=90, region_id=region)
                 result.step("绑定完成")
 
                 # 先验证再改 DNS：新 IP 万一也被墙，解析不会被带到废 IP 上
@@ -400,7 +442,7 @@ class Engine:
                     last_error = f"新 IP {new.ip} 验证未通过（可能同样被墙）：{verified.reason}"
                     # 新 IP 也不行：解绑并释放，继续尝试下一个
                     await self._cleanup_failed(
-                        new, old, target, region, result, keep_old_bound=True
+                        client, new, old, target, region, result, keep_old_bound=True
                     )
                     result.new_ip = result.new_allocation_id = ""
                     result.dns = []
@@ -432,7 +474,7 @@ class Engine:
                 if self.settings.release_old and self.cfg.switch.release_old:
                     try:
                         result.step("释放旧 EIP")
-                        await self.aliyun.release(old.allocation_id, region_id=region)
+                        await client.release(old.allocation_id, region_id=region)
                     except AliyunError as exc:
                         result.step(f"旧 EIP 释放失败（不影响换 IP）：{exc}")
                 else:
@@ -461,7 +503,7 @@ class Engine:
                 result.step(f"失败：{exc}")
                 log.error("%s 换 IP 第 %d 次失败：%s", name, attempt, exc)
                 if new:
-                    await self._rollback(new, old, target, region, result)
+                    await self._rollback(client, new, old, target, region, result)
                 if attempt < self.cfg.switch.max_attempts:
                     backoff = min(15, 3 * attempt)
                     result.step(f"{backoff}s 后重试")
@@ -471,7 +513,7 @@ class Engine:
                 log.exception("%s 换 IP 未预期异常", name)
                 result.step(f"未预期异常：{last_error}")
                 if new:
-                    await self._rollback(new, old, target, region, result)
+                    await self._rollback(client, new, old, target, region, result)
                 break
 
         # 全部失败
@@ -480,7 +522,7 @@ class Engine:
         if self.cfg.switch.restore_old_on_failure and old and not old.bound:
             try:
                 result.step("尝试把旧 EIP 绑回实例")
-                await self.aliyun.associate(old.allocation_id, target.instance_id, region_id=region)
+                await client.associate(old.allocation_id, target.instance_id, region_id=region)
                 result.step("旧 EIP 已绑回（旧 IP 仍可能被墙）")
             except AliyunError as exc:
                 result.step(f"旧 EIP 绑回失败：{exc}")
@@ -498,15 +540,16 @@ class Engine:
         )
         return result
 
-    async def _wait_available(self, allocation_id: str, region: str) -> None:
+    async def _wait_available(self, client: AliyunVpc, allocation_id: str, region: str) -> None:
         try:
-            await self.aliyun.wait_status(allocation_id, {"Available"}, timeout=60, region_id=region)
+            await client.wait_status(allocation_id, {"Available"}, timeout=60, region_id=region)
         except AliyunError as exc:
             # 部分地域分配后直接就是 InUse/状态字段缺失，不阻塞
             log.debug("等待 Available 超时（继续）：%s", exc)
 
     async def _cleanup_failed(
         self,
+        client: AliyunVpc,
         new: EipInfo,
         old: EipInfo,
         target: TargetConfig,
@@ -517,20 +560,26 @@ class Engine:
     ) -> None:
         try:
             result.step("新 IP 不可用，解绑并释放新 EIP")
-            await self.aliyun.unassociate(new.allocation_id, target.instance_id, region_id=region)
-            await self.aliyun.release(new.allocation_id, region_id=region)
+            await client.unassociate(new.allocation_id, target.instance_id, region_id=region)
+            await client.release(new.allocation_id, region_id=region)
         except AliyunError as exc:
             log.warning("清理新 EIP 失败：%s", exc)
             result.step(f"清理新 EIP 失败：{exc}")
         if keep_old_bound:
             try:
                 result.step("把旧 EIP 重新绑回，等待下一次尝试")
-                await self.aliyun.associate(old.allocation_id, target.instance_id, region_id=region)
+                await client.associate(old.allocation_id, target.instance_id, region_id=region)
             except AliyunError as exc:
                 log.warning("旧 EIP 回绑失败：%s", exc)
 
     async def _rollback(
-        self, new: EipInfo, old: EipInfo, target: TargetConfig, region: str, result: SwitchResult
+        self,
+        client: AliyunVpc,
+        new: EipInfo,
+        old: EipInfo,
+        target: TargetConfig,
+        region: str,
+        result: SwitchResult,
     ) -> None:
         """分配/绑定/解析任一步失败时的回滚：解绑并释放新 EIP，尽量恢复旧 EIP。"""
         # 解析可能已经部分改到新 IP 上，先改回旧 IP，避免解析指向即将释放的地址
@@ -543,24 +592,24 @@ class Engine:
                 log.warning("回滚解析失败：%s", exc)
                 result.step(f"回滚解析失败，请手动处理：{exc}")
         try:
-            info = await self.aliyun.get_eip(new.allocation_id, region_id=region)
+            info = await client.get_eip(new.allocation_id, region_id=region)
             if info and info.instance_id:
                 result.step("回滚：解绑新 EIP")
-                await self.aliyun.unassociate(new.allocation_id, info.instance_id, region_id=region)
+                await client.unassociate(new.allocation_id, info.instance_id, region_id=region)
         except AliyunError as exc:
             log.warning("回滚解绑失败：%s", exc)
         try:
-            await self.aliyun.release(new.allocation_id, region_id=region)
+            await client.release(new.allocation_id, region_id=region)
             result.step("回滚：已释放新 EIP")
         except AliyunError as exc:
             log.warning("回滚释放失败（可能仍在计费）：%s", exc)
             result.step(f"回滚：新 EIP 释放失败，请手动处理 {new.allocation_id}")
         # 旧 EIP 如果没有绑定回去就绑回，保证业务至少还能操作
         try:
-            info = await self.aliyun.get_eip(old.allocation_id, region_id=region)
+            info = await client.get_eip(old.allocation_id, region_id=region)
             if info and not info.bound:
                 result.step("回滚：把旧 EIP 绑回实例")
-                await self.aliyun.associate(old.allocation_id, target.instance_id, region_id=region)
+                await client.associate(old.allocation_id, target.instance_id, region_id=region)
         except AliyunError as exc:
             log.warning("回滚旧 EIP 失败：%s", exc)
 
@@ -570,7 +619,7 @@ class Engine:
             await asyncio.sleep(delay)
         best: ProbeOutcome | None = None
         for i in range(1, self.cfg.detect.verify_attempts + 1):
-            outcome = await self._probe(ip, target.probe_port or self.cfg.detect.port, target.dns_records)
+            outcome = await self._probe(target, ip)
             best = outcome
             log.info("%s 验证第 %d 次：%s", target.name, i, outcome.reason)
             if outcome.ok:

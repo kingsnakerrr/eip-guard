@@ -51,31 +51,28 @@ def probe_lines(probe: ProbeOutcome | None) -> str:
     return "\n".join(lines)
 
 
-def layer_table(probe: ProbeOutcome | None) -> str:
-    """把墙内/墙外每层结果列成表，便于一眼看出封在哪一层。"""
-    if not probe or not probe.nodes:
+def port_matrix(probe: ProbeOutcome | None) -> str:
+    """国内外端口对照表 —— 这就是 ping.pe 给出的那种信息，只是自动跑。"""
+    if not probe or not probe.ports:
         return ""
-    order = ("icmp", "tcp", "tls", "http", "aux")
-    rows = ["层 | 墙内 | 墙外"]
-    for layer in order:
-        cn_marks: list[str] = []
-        os_marks: list[str] = []
-        for node in probe.nodes:
-            item = node.layers.get(layer)
-            if item is None:
-                continue
-            mark = item.mark()
-            if item.ok is False and item.kind:
-                mark += f"({item.kind})"
-            (cn_marks if node.zone == "cn" else os_marks).append(mark)
-        if not cn_marks and not os_marks:
-            continue
-        names = {"icmp": "ICMP", "tcp": "TCP", "tls": "TLS", "http": "HTTP", "aux": "其它端口"}
-        rows.append(f"{names[layer]} | {' '.join(cn_marks) or '–'} | {' '.join(os_marks) or '–'}")
-    lines = ["<b>分层结果</b>"]
-    for row in rows:
-        cells = [c.strip() for c in row.split("|")]
-        lines.append("  " + " · ".join(cells))
+    lines = ["<b>端口对照</b>（国内 / 国外）"]
+    for item in probe.ports:
+        mark = " ← 节点端口" if item.port == probe.node_port else ""
+        if item.cn == "fail" and item.os == "ok":
+            hint = "被墙"
+        elif item.os == "fail":
+            hint = "服务本身不通"
+        elif item.cn == "ok":
+            hint = "正常"
+        elif item.cn == "fail" and item.os == "untested":
+            hint = "国外未测"
+        else:
+            hint = ""
+        suffix = f" · {hint}" if hint else ""
+        lines.append(f"  {item.line()}{suffix}{mark}")
+    icmp = f"ICMP 国内 {probe.icmp_cn} / 国外 {probe.icmp_os}"
+    icmp = icmp.replace("ok", "通").replace("fail", "不通").replace("untested", "未测")
+    lines.append(f"  {icmp}")
     return "\n".join(lines)
 
 
@@ -86,7 +83,7 @@ def status_block(name: str, state: TargetState, detail: dict[str, Any], auto: bo
     lines = [
         f"{health_icon(state)} <b>{esc(name)}</b>"
         + (f" · {esc(target.notes)}" if target.notes else ""),
-        f"  实例 <code>{esc(target.instance_id)}</code>",
+        f"  实例 <code>{esc(target.instance_id)}</code> · 账号 {esc(target.account)}",
     ]
     if eip:
         bound = f" → {esc(eip.instance_id)}" if eip.instance_id else " （未绑定）"
@@ -95,8 +92,9 @@ def status_block(name: str, state: TargetState, detail: dict[str, Any], auto: bo
     elif detail.get("error"):
         lines.append(f"  ⚠️ {esc(detail['error'])}")
     if target.dns_records:
-        port = target.probe_port or detail.get("port") or 443
-        lines.append(f"  域名 {esc(', '.join(target.dns_records))} · 探测端口 {port}")
+        ports = ", ".join(str(p) for p in target.all_ports(detail.get("port") or 443))
+        lines.append(f"  域名 {esc(', '.join(target.dns_records))}")
+        lines.append(f"  探测端口 {ports}")
     lines.append(
         f"  连续异常 {state.failures}/{threshold} · 自动换IP {'开' if auto else '关'}"
         f" · 累计换 {state.switches} 次"
@@ -104,9 +102,9 @@ def status_block(name: str, state: TargetState, detail: dict[str, Any], auto: bo
     lines.append(f"  上次检查 {ago(state.last_check)} · 上次切换 {ago(state.last_switch)}")
     if probe:
         lines.append(probe_lines(probe))
-        table = layer_table(probe)
-        if table:
-            lines.append(table)
+        matrix = port_matrix(probe)
+        if matrix:
+            lines.append(matrix)
         if probe.advice:
             lines.append(f"  💡 {esc(probe.advice)}")
     elif state.last_reason:
@@ -120,7 +118,8 @@ def switch_success_text(ev: dict[str, Any]) -> str:
     lines = [
         "✅ <b>EIP 更换成功</b>",
         "",
-        f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
+        f"🎯 目标：<code>{esc(ev.get('target'))}</code>"
+        + (f" · 账号 {esc(ev['account'])}" if ev.get("account") else ""),
         f"📤 旧 IP：<code>{esc(ev.get('old_ip') or '-')}</code>",
         f"📥 新 IP：<code>{esc(ev.get('new_ip') or '-')}</code>",
         f"🧭 触发：{esc(ev.get('reason') or '自动检测')}",
@@ -203,55 +202,48 @@ def blocked_text(ev: dict[str, Any]) -> str:
     if ev.get("count") and ev.get("threshold"):
         lines.append(f"📉 连续异常 {ev['count']}/{ev['threshold']} 次")
     lines.append(f"🔎 {esc(ev.get('detail') or '')}")
+    if ev.get("matrix"):
+        lines.append(str(ev["matrix"]))
     if ev.get("advice"):
         lines.append(f"💡 建议：{esc(ev['advice'])}")
     if will:
         lines.append("🔄 正在自动更换 IP…")
     elif not switchable:
-        lines.append("ℹ️ 这类封锁换 IP 通常无效，需要换端口/域名/协议。确认要换再发 /switch。")
+        lines.append("ℹ️ 这类问题换 IP 解决不了，见上建议。确认仍要换可发 /switch。")
     elif ev.get("auto_off"):
         lines.append("ℹ️ 该目标自动换 IP 已关闭，需要手动 /switch。")
     else:
         lines.append("ℹ️ 尚未达到阈值，暂不动作。")
+    if ev.get("pingpe"):
+        lines.append(f"🔗 自查：{ev['pingpe']}")
     lines.append(f"🕒 {ts(ev.get('ts'))}")
     return "\n".join(lines)
 
 
 def verdict_definitions_text() -> str:
-    """给 /help 或 /verdict 用：每种封锁的定义和是否该换 IP。"""
-    lines = ["<b>判定定义</b>", ""]
+    lines = ["<b>判定定义</b>", "", "<b>核心规则</b>：同一个端口，国内测一次、国外测一次。"]
+    lines.append("")
     rows = [
-        (Verdict.IP_BLOCKED, "ping 可能通，但节点端口和其它端口全部连不上；墙外正常", "换 IP 有效"),
-        (Verdict.PORT_BLOCKED, "只有节点端口不通，其它端口能连；墙外节点端口正常", "换 IP 无效，应换端口"),
-        (Verdict.TLS_BLOCKED, "TCP 能建连，TLS 握手被重置/超时；墙外 TLS 正常", "换 IP 无效，按 SNI/域名阻断"),
+        (Verdict.IP_BLOCKED, "国内连不上、国外能连，且这台 IP 没有别的端口能从国内连上", "换 IP 有效"),
+        (Verdict.PORT_BLOCKED, "只有这个端口国内不通，同 IP 其它端口国内能连", "换端口最有效，换 IP 也可能有用"),
+        (Verdict.TLS_BLOCKED, "TCP 能连，TLS 握手被断，国外 TLS 正常", "换 IP 无效，按 SNI/域名阻断"),
         (Verdict.DATA_BLOCKED, "TCP 与 TLS 都通，一传 HTTP 数据就被断", "换 IP 无效，按流量特征阻断"),
-        (Verdict.DOWN, "墙外也连不上，或端口根本没人监听", "实例/服务故障，先修服务"),
-        (Verdict.OK, "各层都正常", "—"),
-        (Verdict.UNKNOWN, "缺少墙内探针，无法区分被墙和故障", "补一个 zone: cn 的探针"),
+        (Verdict.SERVICE_DOWN, "这个端口国内外都连不上", "服务没起/安全组/防火墙，换 IP 无效"),
+        (Verdict.OK, "国内能正常连上", "—"),
+        (Verdict.UNKNOWN, "缺国内或国外探针，没法对比", "补探针"),
     ]
     for verdict, desc, action in rows:
         lines.append(f"{VERDICT_ICONS[verdict]} <b>{VERDICT_LABELS[verdict]}</b>：{desc}")
         if action != "—":
             lines.append(f"    → {action}")
     lines.append("")
+    lines.append("<b>为什么不能靠 22 端口判断</b>：")
+    lines.append("  • 22 通、443 不通 → 可能只是 443 服务挂了，也可能只封了 443")
+    lines.append("  • 22 也不通 → 可能 22 被封，也可能 SSH 挂了")
+    lines.append("  两种情况都说明不了 IP 是否被墙。只有「同一端口国内不通 + 国外通」才是墙。")
+    lines.append("")
     lines.append("自动换 IP 只在判定为「IP 被墙」时触发（可在 switch.auto_switch_on 里加其它类型）。")
     return "\n".join(lines)
-
-
-def service_down_text(ev: dict[str, Any]) -> str:
-    """墙外也不通：是服务/实例故障，不是墙。"""
-    return "\n".join(
-        [
-            "⚫ <b>服务不可用（不是被墙）</b>",
-            "",
-            f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
-            f"📤 IP：<code>{esc(ev.get('ip'))}</code>",
-            f"🔎 {esc(ev.get('detail') or '')}",
-            "💡 墙外节点也连不上，换 IP 解决不了。请检查：实例状态、安全组、"
-            "系统防火墙、服务进程是否在监听该端口。",
-            f"🕒 {ts(ev.get('ts'))}",
-        ]
-    )
 
 
 def recovered_text(ev: dict[str, Any]) -> str:
@@ -265,6 +257,26 @@ def recovered_text(ev: dict[str, Any]) -> str:
             f"🕒 {ts(ev.get('ts'))}",
         ]
     )
+
+
+def service_down_text(ev: dict[str, Any]) -> str:
+    """国内外都不通：服务/安全组问题，不是墙。"""
+    lines = [
+        "⚫ <b>服务不可用（不是被墙）</b>",
+        "",
+        f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
+        f"📤 IP：<code>{esc(ev.get('ip'))}</code>",
+        f"🔎 {esc(ev.get('detail') or '')}",
+    ]
+    if ev.get("matrix"):
+        lines.append(str(ev["matrix"]))
+    lines.append(
+        "💡 这个端口国内外都连不上，换 IP 解决不了。依次检查："
+        "① 服务进程在监听吗（ss -lntp）② 阿里云安全组放行了吗 "
+        "③ 系统防火墙（firewalld/ufw/iptables）④ 云盾/黑洞"
+    )
+    lines.append(f"🕒 {ts(ev.get('ts'))}")
+    return "\n".join(lines)
 
 
 def dns_text(ev: dict[str, Any]) -> str:
@@ -284,7 +296,11 @@ def dns_text(ev: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def settings_text(settings: Any, auto_states: dict[str, bool], auto_switch_on: list[str] | None = None) -> str:
+def settings_text(
+    settings: Any,
+    auto_states: dict[str, bool],
+    auto_switch_on: list[str] | None = None,
+) -> str:
     lines = [
         "⚙️ <b>当前设置</b>",
         "",
@@ -307,3 +323,23 @@ def settings_text(settings: Any, auto_states: dict[str, bool], auto_switch_on: l
     lines.append("命令：/set interval 60 · /set threshold 3 · /set cooldown 900 · /set release on|off")
     lines.append("判定说明：/verdict")
     return "\n".join(lines)
+
+
+def matrix_text(probe: ProbeOutcome | None) -> str:
+    """告警里附带的国内外端口对照（纯文本，正则可读）。"""
+    text = port_matrix(probe)
+    if not text:
+        return ""
+    return text.replace("<b>", "").replace("</b>", "")
+
+
+def pingpe_line(target: Any, ip: str = "") -> str:
+    """给 /probe /status 附上 ping.pe 自查链接（人工复核）。"""
+    if not ip:
+        return ""
+    port = getattr(target, "probe_port", 0) or 443
+    host = f"{ip}:{port}"
+    url = f"https://ping.pe/{host}"
+    if getattr(target, "dns_records", None):
+        url += f"?host={target.dns_records[0]}"
+    return f"🔗 人工复核（ping.pe）：{esc(url)}"

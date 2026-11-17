@@ -27,7 +27,9 @@ from aiohttp import web
 
 MAX_ATTEMPTS = 5
 MAX_CONCURRENCY = 64
-VALID_LAYERS = {"icmp", "tcp", "tls", "http", "aux"}
+VALID_LAYERS = {"icmp", "tcp", "tls", "http"}
+# 这台探针在网络上的位置，只用于自我介绍；真正的 zone 由主程序配置决定
+SELF_ZONE = os.getenv("ZONE", "overseas")
 _sem: asyncio.Semaphore
 
 
@@ -145,18 +147,16 @@ async def http_check(ip: str, port: int, sni: str, path: str, timeout: float) ->
                 pass
 
 
-async def probe_layers(
+async def probe_port(
     ip: str,
     port: int,
     sni: str,
     timeout: float,
     layers: list[str],
     attempts: int,
-    aux_ports: list[int],
     http_path: str,
 ) -> dict[str, Any]:
-    """按层探测。每层做 attempts 次，任一次成功即算该层通。"""
-    result: dict[str, Any] = {}
+    """测一个端口：tcp 必测；tls/http 只在 tcp 通时才测。"""
 
     async def repeatedly(fn, *args) -> dict[str, Any]:
         best: dict[str, Any] | None = None
@@ -167,39 +167,26 @@ async def probe_layers(
             best = best or item
         return best or {"ok": False, "kind": "other", "error": "没有结果"}
 
-    if "icmp" in layers:
-        result["icmp"] = await ping(ip, min(attempts + 1, 3), timeout)
-    if "tcp" in layers:
-        result["tcp"] = await repeatedly(tcp, ip, port, timeout)
+    tcp_result = await repeatedly(tcp, ip, port, timeout)
+    out: dict[str, Any] = {"tcp": tcp_result}
     if "tls" in layers:
-        if result.get("tcp", {}).get("ok"):
-            result["tls"] = await repeatedly(tls, ip, port, sni, timeout)
+        if tcp_result.get("ok"):
+            out["tls"] = await repeatedly(tls, ip, port, sni, timeout)
         else:
-            result["tls"] = {"ok": None, "error": "TCP 不通，跳过 TLS"}
+            out["tls"] = {"ok": None, "error": "TCP 不通，跳过 TLS"}
     if "http" in layers:
-        if result.get("tls", {}).get("ok"):
-            result["http"] = await repeatedly(http_check, ip, port, sni, http_path, timeout)
+        if out.get("tls", {}).get("ok"):
+            out["http"] = await repeatedly(http_check, ip, port, sni, http_path, timeout)
         else:
-            result["http"] = {"ok": None, "error": "TLS 不通，跳过 HTTP"}
-    if "aux" in layers:
-        ports: dict[str, Any] = {}
-        for aux_port in aux_ports:
-            ports[str(aux_port)] = await tcp(ip, aux_port, timeout)
-        any_ok = any(v.get("ok") for v in ports.values())
-        result["aux"] = {
-            "ok": any_ok if ports else None,
-            "detail": " ".join(f"{p}{'✓' if v.get('ok') else '✗'}" for p, v in ports.items()),
-            "ports": ports,
-            "kind": "" if any_ok else "timeout",
-        }
-    return result
+            out["http"] = {"ok": None, "error": "TLS 不通，跳过 HTTP"}
+    return out
 
 
 def make_app(token: str) -> web.Application:
     app = web.Application()
 
     async def health(_: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "zone": "overseas", "time": int(time.time()),
+        return web.json_response({"ok": True, "zone": SELF_ZONE, "time": int(time.time()),
                                   "ping": bool(shutil.which("ping"))})
 
     async def probe(request: web.Request) -> web.Response:
@@ -218,42 +205,47 @@ def make_app(token: str) -> web.Application:
         if not ip or len(ip) > 64:
             return web.json_response({"error": "ip required"}, status=400)
         try:
-            port = int(body.get("port") or 443)
             attempts = max(1, min(MAX_ATTEMPTS, int(body.get("attempts") or 2)))
             timeout = float(body.get("timeout") or 6.0)
         except (TypeError, ValueError):
-            return web.json_response({"error": "bad port/attempts/timeout"}, status=400)
-        if not (1 <= port <= 65535):
-            return web.json_response({"error": "port out of range"}, status=400)
+            return web.json_response({"error": "bad attempts/timeout"}, status=400)
+
+        # 兼容旧客户端：只给 port 时当成单端口
+        raw_ports = body.get("ports")
+        if raw_ports is None:
+            raw_ports = [body.get("port") or 443]
+        ports: list[int] = []
+        for item in raw_ports if isinstance(raw_ports, list) else [raw_ports]:
+            try:
+                port = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535 and port not in ports and len(ports) < 8:
+                ports.append(port)
+        if not ports:
+            return web.json_response({"error": "ports required"}, status=400)
 
         sni = str(body.get("sni") or "")[:253]
         http_path = str(body.get("http_path") or "/")[:200]
-        raw_layers = body.get("layers") or ["icmp", "tcp", "tls"]
-        layers = [str(x).lower() for x in raw_layers if str(x).lower() in VALID_LAYERS] or ["tcp"]
-        raw_aux = body.get("aux_ports") or []
-        aux_ports: list[int] = []
-        for item in raw_aux if isinstance(raw_aux, list) else []:
-            try:
-                aux_port = int(item)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= aux_port <= 65535 and aux_port != port and len(aux_ports) < 8:
-                aux_ports.append(aux_port)
-        # 给了其它端口就必须测 aux 层，否则客户端会以为"全部端口不通"
-        if aux_ports and "aux" not in layers:
-            layers.append("aux")
+        raw_layers = body.get("layers") or ["icmp", "tls"]
+        layers = [str(x).lower() for x in raw_layers if str(x).lower() in VALID_LAYERS]
 
         async with _sem:
-            layers_result = await probe_layers(
-                ip, port, sni, timeout, layers, attempts, aux_ports, http_path
-            )
+            icmp_result = await ping(ip, min(attempts + 1, 3), timeout) if "icmp" in layers else None
+            port_results = {}
+            # 只对第一个端口做 TLS/HTTP（节点端口），其它端口只测 TCP，省时间
+            for index, port in enumerate(ports):
+                port_layers = layers if index == 0 else ["tcp"]
+                port_results[str(port)] = await probe_port(
+                    ip, port, sni, timeout, port_layers, attempts, http_path
+                )
         return web.json_response(
             {
                 "ok": True,
                 "ip": ip,
-                "port": port,
-                "zone": "overseas",
-                "layers": layers_result,
+                "ports": port_results,
+                "icmp": icmp_result,
+                "zone": SELF_ZONE,
                 "ts": int(time.time()),
             }
         )

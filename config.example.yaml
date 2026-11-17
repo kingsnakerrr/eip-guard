@@ -10,13 +10,18 @@ telegram:
   # 通知频道；运行时可用 /channel 覆盖
   channel_id: "${TG_CHANNEL_ID:-}"
 
+# ---------------- 阿里云账号（可以有多个）----------------
+# target 里用 account: 账号名 指定这台机器在哪个账号下
 aliyun:
-  access_key_id: "${ALIYUN_AK_ID}"
-  access_key_secret: "${ALIYUN_AK_SECRET}"
-  # 默认地域，target 里可单独覆盖
-  region_id: "cn-hongkong"
-  endpoint: "vpc.aliyuncs.com"
-  api_version: "2016-04-28"
+  accounts:
+    - name: "main"
+      access_key_id: "${ALIYUN_AK_ID}"
+      access_key_secret: "${ALIYUN_AK_SECRET}"
+      default_region: "cn-hongkong"     # 该账号的默认地域
+    - name: "second"                     # 你的第二个号
+      access_key_id: "${ALIYUN_AK_ID_2}"
+      access_key_secret: "${ALIYUN_AK_SECRET_2}"
+      default_region: "cn-hongkong"
 
 # 日志时区，只影响消息里的时间显示
 timezone: "Asia/Shanghai"
@@ -36,45 +41,44 @@ cloudflare:
   create_missing: true
 
 detect:
-  # 检测方式：probe_agent（自建境外探针，最可靠）/ checkhost（免费公共 API）/ hybrid
+  # 检测方式：probe_agent（自建国内外探针，最可靠）/ checkhost（免费公共 API）/ hybrid
   provider: "probe_agent"
-  # 默认探测端口，target 可覆盖
+  # 默认探测端口，target 可覆盖（就是你的业务端口，比如 443）
   port: 443
   # 多少秒检查一轮
   interval: 60
   # 连续多少轮判定异常才动作（防抖）
   failure_threshold: 3
-  # 单次探测：判定“异常”所需的失败样本占比，以及最少样本数
+  # 单次探测：判定“异常”所需的失败样本占比
   fail_ratio: 0.6
-  min_samples: 1
   timeout: 6.0
   # 每个探针每层探测几次（任一次成功即视为该层通）
   attempts: 2
-  # 分层探测。只测 TCP 会把「能 ping 通但端口全废」误判成正常，所以默认加上 icmp + tls。
-  #   icmp — 判断 IP 还能不能 ping（注意：能 ping 通不代表可用）
-  #   tcp  — 节点端口能否建连（必测）
-  #   tls  — TLS 握手，发现 SNI/证书指纹阻断
-  #   http — TLS 之上真的发一次请求，发现“握手能过、一传数据就断”
-  #   aux  — 探测 aux_ports 里的其它端口，用来区分「整台 IP 被封」还是「只封了一个端口」
-  layers: ["icmp", "tcp", "tls"]
-  # 建议配上：用来区分「IP 被墙」和「只封了 443」。填你机器上实际开放的其它端口
-  #（例如 SSH 22、面板 8443、备用 Web 80）
+  # 可选层：icmp（ping）、tls（握手，查 SNI 阻断）、http（查数据面）。
+  # 注意：tcp 对每个端口一定会测，不用写。
+  layers: ["icmp", "tls"]
+  # 全局默认辅助端口。用来区分「整台 IP 被封」和「只封了业务端口」。
+  # 填这台机器上真实开放的其它端口（SSH 22、备用 Web 80、面板 8443…）
   aux_ports: [22, 80]
   # 需要 http 层时的请求路径
   http_path: "/"
-  # 固定 SNI；留空则用 target.dns_records 的第一个域名
-  sni: ""
   # 更换后验证
   verify_delay: 20
   verify_attempts: 3
   verify_success_needed: 1
 
   probe_agent:
-    # 可写多个，逗号分隔，每个都是一台境外 VPS
-    urls: "${PROBE_AGENT_URL}"
-    token: "${PROBE_AGENT_TOKEN}"
-    # 每个节点发起几次 TCP 连接
-    attempts: 3
+    # 建议至少 2 个：一个国内（zone: cn）、一个国外（zone: overseas）
+    # 判定的核心就是「同一端口，国内不通 + 国外通」
+    agents:
+      - url: "${PROBE_CN_URL}"
+        token: "${PROBE_AGENT_TOKEN}"
+        zone: "cn"
+        name: "cn-probe"
+      - url: "${PROBE_OS_URL}"
+        token: "${PROBE_AGENT_TOKEN}"
+        zone: "overseas"
+        name: "os-probe"
 
   checkhost:
     max_nodes: 6
@@ -84,7 +88,7 @@ switch:
   # 是否自动更换；机器人里也能开关
   auto: true
   # 只有这些判定结论才允许自动换 IP。
-  # 默认只有 ip_blocked：端口封锁 / TLS 阻断 / 数据面阻断换 IP 都无效，白花钱。
+  # 默认只有 ip_blocked；端口封锁换 IP 往往无效，所以不默认换。
   # 想更激进可以写 ["ip_blocked", "port_blocked"]
   auto_switch_on: ["ip_blocked"]
   # 一次被墙事件最多尝试几个新 IP
@@ -93,7 +97,7 @@ switch:
   cooldown: 900
   # 成功后释放旧 EIP（省钱；设 false 会继续收未绑定 EIP 的费用）
   release_old: true
-  # 全部尝试失败时，把旧 EIP 重新绑回去（旧 IP 已墙，仅保证控制面可操作）
+  # 全部尝试失败时，把旧 EIP 重新绑回去
   restore_old_on_failure: true
   # 新 EIP 分配参数：留空表示沿用旧 EIP 的计费方式和带宽
   internet_charge_type: ""     # PayByTraffic / PayByBandwidth
@@ -103,15 +107,27 @@ switch:
 
 targets:
   - name: "hk-main"
+    account: "main"                      # 用哪个阿里云账号
     instance_id: "i-j6cxxxxxxxxxxxxxxxx"
     # 可选：不填会自动按实例查找绑定中的 EIP
     eip_allocation_id: "eip-j6cxxxxxxxxxxxxxxxx"
-    # 可选：单独指定地域
+    # 可选：单独指定地域（覆盖账号默认地域）
     # region_id: "cn-hongkong"
-    # 探测端口；不填用 detect.port
+    # 业务端口；不填用 detect.port
     probe_port: 443
+    # 可选：这台机器上真实开放的其它端口，覆盖全局 detect.aux_ports
+    aux_ports: [22, 80]
     # 需要跟随新 IP 的域名记录（相对 zone 或完整域名均可）
     dns_records:
       - "hk.example.com"
       - "api.example.com"
     notes: "香港主站"
+
+  - name: "sg-second"
+    account: "second"                    # 第二个阿里云账号的机器
+    instance_id: "i-t4nxxxxxxxxxxxxxxxx"
+    probe_port: 443
+    aux_ports: [22]
+    dns_records:
+      - "sg.example.com"
+    notes: "新加坡备用"
