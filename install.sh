@@ -674,18 +674,37 @@ install_probe() {
 
   ensure_firewall "$PROBE_PORT"
 
-  local ip; ip="$(curl -fsS --max-time 6 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
+  local pub lan
+  pub="$(curl -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+  lan="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
+  [ -z "$lan" ] && lan="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
   echo
   ok "探针已就绪（zone=${ZONE}）"
   msg ""
-  msg "  地址：${BLD}http://${ip}:${PROBE_PORT}${RST}"
   msg "  token：${BLD}${token}${RST}"
+  msg ""
+  if [ -n "$pub" ] && [ -n "$lan" ] && [ "$pub" != "$lan" ]; then
+    msg "  公网地址：${BLD}http://${pub}:${PROBE_PORT}${RST}"
+    msg "  内网地址：${BLD}http://${lan}:${PROBE_PORT}${RST}"
+    msg ""
+    warn "这台机器是内网 IP（NAT/桥接内网）。公网地址只有做了端口转发才能从外网访问。"
+    dim "   · 主程序在同一内网 -> 用内网地址"
+    dim "   · 主程序在外网     -> 需把 ${PROBE_PORT} 转发到 ${lan}（PVE：宿主机 iptables/nft 或软路由端口转发）"
+  else
+    msg "  地址：${BLD}http://${pub:-$lan}:${PROBE_PORT}${RST}"
+  fi
   [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
   msg ""
+  local use_ip="${pub:-$lan}"
+  if [ -n "$lan" ] && [ -n "$pub" ] && [ "$pub" != "$lan" ]; then
+    use_ip="$lan"
+    dim "下面默认用内网地址；若主程序在公网，把 IP 换成 ${pub} 并确认已做端口转发"
+  fi
   if [ "$ZONE" = "cn" ]; then
-    dim "填进主程序 .env：PROBE_CN_URL=http://${ip}:${PROBE_PORT}"
+    dim "填进主程序：PROBE_CN_URL=http://${use_ip}:${PROBE_PORT}"
   else
-    dim "填进主程序 .env：PROBE_OS_URL=http://${ip}:${PROBE_PORT}"
+    dim "填进主程序：PROBE_OS_URL=http://${use_ip}:${PROBE_PORT}"
   fi
   dim "别忘了把上面的 token 填进主程序的 PROBE_AGENT_TOKEN"
   return 0
