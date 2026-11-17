@@ -1,0 +1,6 @@
+python-telegram-bot[socks]>=21.6,<23
+aiohttp>=3.9
+PyYAML>=6.0
+python-dotenv>=1.0
+aliyun-python-sdk-core>=2.15
+aliyun-python-sdk-vpc>=2.17

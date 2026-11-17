@@ -1,0 +1,17 @@
+[Unit]
+Description=EIP Guard probe agent (overseas)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/eip-probe
+EnvironmentFile=/opt/eip-probe/probe.env
+ExecStart=/usr/bin/python3 /opt/eip-probe/server.py --port 8787
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

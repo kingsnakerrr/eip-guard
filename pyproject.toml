@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eipguard"
+version = "1.0.0"
+description = "阿里云 EIP 被墙自动更换 + Cloudflare 域名解析同步 + Telegram 机器人"
+requires-python = ">=3.10"
+dependencies = [
+  "python-telegram-bot[socks]>=21.6,<23",
+  "aiohttp>=3.9",
+  "PyYAML>=6.0",
+  "python-dotenv>=1.0",
+  "aliyun-python-sdk-core>=2.15",
+  "aliyun-python-sdk-vpc>=2.17",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+eipguard = "eipguard.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

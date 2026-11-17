@@ -1,0 +1,16 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "vpc:DescribeEipAddresses",
+        "vpc:AllocateEipAddress",
+        "vpc:AssociateEipAddress",
+        "vpc:UnassociateEipAddress",
+        "vpc:ReleaseEipAddress"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

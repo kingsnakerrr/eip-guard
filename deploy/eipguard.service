@@ -1,0 +1,24 @@
+[Unit]
+Description=EIP Guard (Aliyun EIP auto-switch + Cloudflare DNS + Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/eipguard
+ExecStart=/opt/eipguard/.venv/bin/python -m eipguard -c /opt/eipguard/config.yaml
+User=eipguard
+Group=eipguard
+Restart=always
+RestartSec=5
+# 少给点权限
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/eipguard/data
+# .env 里是明文密钥，尽量只让服务用户读
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

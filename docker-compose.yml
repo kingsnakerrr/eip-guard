@@ -1,0 +1,27 @@
+services:
+  eipguard:
+    build: .
+    container_name: eipguard
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+
+  # 可选：把境外探针也跑在同一台境外机器上（墙内机器人远程调用它）
+  # 注意 zone 必须是 overseas，且要开放 8787 端口或走内网/隧道
+  probe:
+    image: python:3.12-slim
+    container_name: eip-probe
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./probe_agent:/app
+    command: >
+      sh -c "pip install --no-cache-dir aiohttp &&
+             PROBE_TOKEN=${PROBE_AGENT_TOKEN} python server.py --port 8787"
+    ports:
+      - "8787:8787"
+    profiles: ["probe"]
