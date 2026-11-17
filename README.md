@@ -24,12 +24,12 @@
 | **Telegram Bot Token** | 机器人本体 | 找 [@BotFather](https://t.me/BotFather) `/newbot` |
 | **Telegram 你的 chat id** | 谁能控制机器人 | 私聊 [@userinfobot](https://t.me/userinfobot)，或用 `/bind` |
 | **Telegram 频道 id**（可选） | 把告警广播出去 | 频道加机器人当管理员，id 形如 `-1001234567890` |
-| **国内 VPS** | 提供"国内视角" | 最便宜国内小鸡即可 |
-| **境外 VPS** | 提供"国外视角" | 最便宜海外小鸡即可 |
+| **国内机器** | 提供"国内视角" | 家宽 PVE / 国内 VPS 都行（家宽用反向模式，无需公网 IP） |
+| **境外 VPS** | 装主程序 + "国外视角" | 最便宜海外小鸡即可 |
 
-> **必须两台探针**：一台在国内（`--zone cn`）、一台在国外（`--zone overseas`）。
+> **两边都要有探针**：国内（`--zone cn`）+ 国外（`--zone overseas`）。
 > 判定的核心是「同一端口，国内不通 + 国外通」，缺任何一侧都无法下结论。
-> 没有国内机器时可临时用 `provider: checkhost`（公共 API，节点里常有中国的，免费但限流）。
+> 主程序装在国外 VPS 时，国外探针可以和它同机（填 `127.0.0.1`）；国内那台在家宽后面就用反向模式。
 
 ### 多账号
 
@@ -180,19 +180,29 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/in
 bash <(curl -Ls .../install.sh) --pip-index https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-### 国内探针在家宽后面？
+### 国内探针在家宽后面？（家宽没有公网 IP）
 
-如果国内探针装在家用宽带的 PVE/软路由里，国外的主程序通常**访问不到**它（家宽大多没有公网 IP）。
-先用这条命令确认：
+**不需要公网 IP。** 用反向模式，让家里那台主动连主程序：
 
 ```bash
-bash <(curl -Ls .../install.sh) --check-probe http://你的家宽地址:8787 --token 你的token
+# 家宽那台（PVE 里的 Debian）
+bash <(curl -Ls .../install.sh) --probe --mode client --zone cn \
+  --hub ws://国外VPS的IP:8790 --token 你的token
 ```
 
-- 显示 `✓ 探测请求成功` → 直接填地址即可
-- 显示 `✗ TCP 不可达` → 走 Tailscale 或 frp
+主程序侧只要在 `config.yaml` 里开 hub，并放行 8790：
 
-完整方案（含 Tailscale、frp、CF Tunnel 三种做法）见 **[docs/家宽探针方案.md](docs/家宽探针方案.md)**。
+```yaml
+detect:
+  hub:
+    enabled: true
+    port: 8790
+    token: "${PROBE_AGENT_TOKEN:-}"
+```
+
+家宽只做出站连接，不用端口转发、不用动路由器。详见 **[docs/家宽探针方案.md](docs/家宽探针方案.md)**。
+
+（有公网 IP 的机器仍可用普通模式：`--probe --zone cn`，主程序填 `http://IP:8787`。）
 
 ### 装完检查
 

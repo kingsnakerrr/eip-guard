@@ -689,13 +689,20 @@ def _aggregate_layer(nodes: list[NodeResult], port: int, name: str, fail_ratio: 
 
 
 # ---------------------------------------------------------------- 探测器
-def build_detector(cfg: DetectConfig) -> "Detector":
+def build_detector(cfg: DetectConfig, hub: Any = None) -> "Detector":
     if cfg.provider == "checkhost":
         return CheckHostDetector(cfg)
     if cfg.provider == "tcp_self":
         return SelfDetector(cfg)
     if cfg.provider == "hybrid":
         return HybridDetector(cfg)
+    if cfg.provider == "hub":
+        if hub is None:
+            raise RuntimeError("provider: hub 需要先创建 ProbeHub")
+        return HubDetector(cfg, hub)
+    # probe_agent 模式下如果只配了 hub（没有 http 探针地址），也自动用 hub
+    if not cfg.probe_agents and hub is not None and cfg.hub_enabled:
+        return HubDetector(cfg, hub)
     return ProbeAgentDetector(cfg)
 
 
@@ -790,3 +797,80 @@ class HybridDetector(Detector):
         primary.nodes = nodes
         primary.reason = " || ".join(f"[{p.name}] {r.reason}" for p, r in zip(self.parts, results))
         return primary
+
+
+class HubDetector(Detector):
+    """反向探针：家宽/NAT 机器主动连主程序，主程序下发任务。
+
+    和服务端模式得到的结果结构完全一致，所以判定逻辑共用。
+    """
+
+    name = "hub"
+
+    def __init__(self, cfg: DetectConfig, hub: Any) -> None:
+        super().__init__(cfg)
+        self.hub = hub
+
+    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
+        nodes: list[NodeResult] = []
+        for zone in ("cn", "overseas"):
+            if not self.hub.has_zone(zone):
+                continue
+            try:
+                data = await self.hub.probe(
+                    zone,
+                    ip,
+                    ports,
+                    sni=sni,
+                    attempts=self.cfg.attempts,
+                    layers=self.cfg.layers,
+                    timeout=self.cfg.timeout,
+                    http_path=self.cfg.http_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                nodes.append(NodeResult(f"hub-{zone}", zone, error=f"{type(exc).__name__}: {exc}"))
+                continue
+            if not data.get("ok"):
+                nodes.append(NodeResult(f"hub-{zone}", zone, error=str(data.get("error") or "任务失败")))
+                continue
+            node = self._node_from_result(f"hub-{zone}", zone, data)
+            if node is not None:
+                nodes.append(node)
+
+        if not nodes:
+            return ProbeOutcome(
+                Verdict.UNKNOWN,
+                "没有在线的反向探针。检查家里那台 client.py 是否在跑、token 是否一致",
+                [],
+                VERDICT_ADVICE[Verdict.UNKNOWN],
+            )
+        return judge(nodes, ports=ports, fail_ratio=self.cfg.fail_ratio)
+
+    @staticmethod
+    def _node_from_result(name: str, zone: str, data: dict[str, Any]) -> NodeResult | None:
+        def layer(raw: Any) -> LayerResult | None:
+            if not isinstance(raw, dict):
+                return None
+            return LayerResult(
+                ok=raw.get("ok"),
+                ms=raw.get("ms"),
+                kind=str(raw.get("kind") or ""),
+                error=str(raw.get("error") or ""),
+                detail=str(raw.get("detail") or ""),
+            )
+
+        probes: dict[int, PortProbe] = {}
+        for key, item in (data.get("ports") or {}).items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                port = int(key)
+            except (TypeError, ValueError):
+                continue
+            tcp = layer(item.get("tcp"))
+            if tcp is None:
+                continue
+            probes[port] = PortProbe(port, tcp, layer(item.get("tls")), layer(item.get("http")))
+        if not probes:
+            return None
+        return NodeResult(name, zone, layer(data.get("icmp")), probes)

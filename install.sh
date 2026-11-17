@@ -649,9 +649,110 @@ install_main() {
 # =====================================================================
 # 探针
 # =====================================================================
+install_probe_client() {
+  # 家宽/NAT 用：探针主动连主程序，不需要公网 IP、不需要端口转发
+  local hub="${PROBE_HUB:-}" token="$PROBE_TOKEN" zone="$ZONE"
+
+  if [ -z "$token" ]; then
+    token="$(ask '探针 token（和主程序一致）' '')"
+  fi
+  [ -z "$token" ] && die "需要 token（主程序 .env 里的 PROBE_AGENT_TOKEN）"
+
+  if [ -z "$zone" ]; then
+    msg "这台机器在哪一侧？"
+    msg "  1) cn        国内（中国大陆）—— 家宽通常选这个"
+    msg "  2) overseas  国外（境外）"
+    local pick; pick="$(ask '选择' '1')"
+    case "$pick" in 2|overseas) zone="overseas" ;; *) zone="cn" ;; esac
+  fi
+  ZONE="$zone"
+
+  if [ -z "$hub" ]; then
+    msg ""
+    msg "${BLD}主程序地址${RST}：主程序那台机器的 IP + hub 端口（默认 8790）"
+    msg "${DIM}   例：ws://1.2.3.4:8790  （主程序在国外 VPS 上，填它的公网 IP）${RST}"
+    hub="$(ask '主程序 hub 地址' '')"
+  fi
+  [ -z "$hub" ] && die "需要主程序地址（例如 ws://1.2.3.4:8790）"
+  case "$hub" in ws://*|wss://*) ;; *) hub="ws://${hub}" ;; esac
+
+  ensure_python
+  ensure_ping
+
+  local src; src="$(fetch_source)" || die "获取源码失败"
+  info "部署到 $PROBE_DIR"
+  mkdir -p "$PROBE_DIR"
+  cp "$src/probe_agent/server.py" "$src/probe_agent/client.py" "$PROBE_DIR/"
+
+  if ! python3 -c 'import aiohttp' 2>/dev/null; then
+    info "安装 aiohttp"
+    if ! pm_install python3-aiohttp >/dev/null 2>&1 && \
+       ! python3 -m pip install -q aiohttp >/dev/null 2>&1; then
+      python3 -m pip install -q --break-system-packages aiohttp || die "aiohttp 安装失败"
+    fi
+  fi
+
+  printf 'PROBE_TOKEN=%s\nPROBE_HUB=%s\nZONE=%s\nPROBE_NAME=%s\n' \
+    "$token" "$hub" "$ZONE" "$(hostname)" >"$PROBE_DIR/agent.env"
+  chmod 600 "$PROBE_DIR/agent.env"
+
+  if has_systemd; then
+    cat >/etc/systemd/system/eip-probe-client.service <<UNIT
+[Unit]
+Description=eip-probe-client (EIP Guard 反向探针)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROBE_DIR
+EnvironmentFile=$PROBE_DIR/agent.env
+ExecStart=/usr/bin/python3 $PROBE_DIR/client.py --hub \${PROBE_HUB} --token \${PROBE_TOKEN} --zone \${ZONE} --name \${PROBE_NAME}
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable eip-probe-client >/dev/null 2>&1 || true
+    svc_start eip-probe-client
+    sleep 3
+    if systemctl is-active --quiet eip-probe-client; then
+      if journalctl -u eip-probe-client -n 30 --no-pager -o cat 2>/dev/null | grep -q "已连接"; then
+        ok "已连上主程序（zone=$ZONE）"
+      else
+        warn "服务在跑，但还没确认连上。看日志：journalctl -u eip-probe-client -f"
+      fi
+    else
+      err "服务没起来："
+      journalctl -u eip-probe-client -n 20 --no-pager -o cat 2>/dev/null | tail -20
+    fi
+  else
+    warn "手动启动：cd $PROBE_DIR && PROBE_TOKEN=$token PROBE_HUB=$hub ZONE=$zone python3 client.py"
+  fi
+
+  echo
+  ok "反向探针已就绪（zone=$ZONE）"
+  msg ""
+  msg "  它会主动连 ${hub}，不需要公网 IP、不用开端口。"
+  dim "主程序 config.yaml 里需要："
+  dim "  detect:"
+  dim "    hub: {enabled: true, port: 8790, token: \"${token}\"}"
+  msg ""
+  dim "日志：journalctl -u eip-probe-client -f"
+}
+
 install_probe() {
   need_root
   title "安装 / 更新 EIP Guard 探针"
+
+  # 反向模式：机器没有公网 IP（家宽/NAT），主动连主程序
+  if [ "$PROBE_MODE" = "client" ]; then
+    install_probe_client
+    return $?
+  fi
 
   local zone="$ZONE"
   if [ -z "$zone" ]; then
@@ -678,6 +779,7 @@ install_probe() {
   info "部署到 $PROBE_DIR"
   mkdir -p "$PROBE_DIR"
   cp "$src/probe_agent/server.py" "$PROBE_DIR/"
+  cp "$src/probe_agent/client.py" "$PROBE_DIR/" 2>/dev/null || true
 
   # 依赖：优先系统包 aiohttp
   if ! python3 -c 'import aiohttp' 2>/dev/null; then
@@ -976,6 +1078,8 @@ menu() {
 ACTION=""
 ZONE=""
 PROBE_TOKEN="${PROBE_TOKEN:-}"
+PROBE_MODE="${PROBE_MODE:-}"          # server（默认，需公网）| client（反向，家宽）
+PROBE_HUB="${PROBE_HUB:-}"
 PROBE_PORT="${PROBE_PORT:-8787}"
 NON_INTERACTIVE=0
 
@@ -986,12 +1090,11 @@ ${BLD}EIP Guard 安装脚本${RST}
   ${BLD}bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)${RST}
       交互菜单（推荐）
 
-  install.sh --probe --zone cn        装国内探针
-  install.sh --probe --zone overseas  装国外探针
+  install.sh --probe --zone cn                  装国内探针（有公网 IP）
+  install.sh --probe --zone overseas            装国外探针（有公网 IP）
+  install.sh --probe --mode client --zone cn    装反向探针（家宽/NAT，无需公网 IP）
 
   install.sh --install              安装 / 更新主程序
-  install.sh --probe --zone cn      安装探针（国内）
-  install.sh --probe --zone overseas 安装探针（国外）
   install.sh --status | --log | --update | --uninstall
   install.sh --check-probe http://IP:8787 --token xxx   验证探针能否从本机访问
 
@@ -1026,6 +1129,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --install|--main) ACTION="install" ;;
     --probe) ACTION="probe" ;;
+    --mode) PROBE_MODE="${2:-}"; shift ;;
     --status) ACTION="status" ;;
     --check-probe)
       ACTION="check_probe"
@@ -1039,6 +1143,7 @@ while [ $# -gt 0 ]; do
     --port) PROBE_PORT="${2:-}"; shift ;;
     --dir) APP_DIR="${2:-}"; shift ;;
     --probe-dir) PROBE_DIR="${2:-}"; shift ;;
+    --hub) PROBE_HUB="${2:-}"; shift ;;
     --pip-index) PIP_INDEX="${2:-}"; shift ;;
     --repo) REPO="${2:-}"; shift ;;
     --non-interactive) NON_INTERACTIVE=1 ;;

@@ -70,9 +70,19 @@ detect:
   verify_attempts: 3
   verify_success_needed: 1
 
+  # ---------- 反向探针（家宽/NAT 机器用这个）----------
+  # 家里那台没有公网 IP 时，让它主动连过来。主程序不需要能访问它。
+  # 开启后，家里那台跑：
+  #   PROBE_TOKEN=xxx ZONE=cn python3 probe_agent/client.py --hub ws://本机公网IP:8790
+  hub:
+    enabled: false        # 用反向模式就改成 true
+    port: 8790            # 记得在安全组/防火墙放行
+    token: "${PROBE_AGENT_TOKEN:-}"
+
+  # ---------- 普通探针（有公网 IP 的机器用）----------
   probe_agent:
-    # 建议至少 2 个：一个国内（zone: cn）、一个国外（zone: overseas）
     # 判定的核心就是「同一端口，国内不通 + 国外通」
+    # 两种模式可以混用：比如国内用 hub（家宽），国外用直连（VPS）
     agents:
       - url: "${PROBE_CN_URL}"
         token: "${PROBE_AGENT_TOKEN}"

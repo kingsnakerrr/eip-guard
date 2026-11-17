@@ -68,6 +68,7 @@ class Engine:
         aliyun_accounts: dict[str, AliyunVpc] | None = None,
         cloudflare: Cloudflare | None = None,
         detector: Detector | None = None,
+        hub: Any = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -99,7 +100,8 @@ class Engine:
             multi_record_policy=cfg.cloudflare.multi_record_policy,
             api_base=cfg.cloudflare.api_base,
         )
-        self.detector = detector or build_detector(cfg.detect)
+        self.hub = hub
+        self.detector = detector or build_detector(cfg.detect, hub)
         self._locks: dict[str, asyncio.Lock] = {}
         self._running = True
 

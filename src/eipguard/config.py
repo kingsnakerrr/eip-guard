@@ -198,15 +198,25 @@ class DetectConfig:
     probe_agents: list[dict[str, Any]] = field(default_factory=list)
     checkhost_max_nodes: int = 6
     checkhost_timeout: int = 20
+    # 反向探针（家宽/NAT 机器主动连过来），和服务端模式可同时用
+    hub_enabled: bool = False
+    hub_port: int = 8790
+    hub_token: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], default_port: int) -> "DetectConfig":
         provider = str(raw.get("provider") or "probe_agent").lower()
-        if provider not in {"probe_agent", "checkhost", "hybrid", "tcp_self"}:
+        if provider not in {"probe_agent", "checkhost", "hybrid", "tcp_self", "hub"}:
             raise ConfigError(f"未知 detect.provider: {provider}")
         agents = parse_agents(raw.get("probe_agent"))
-        if provider in {"probe_agent", "hybrid"} and not agents:
-            raise ConfigError("detect.provider 需要探针，但 detect.probe_agent 为空")
+        hub_enabled = _as_bool((raw.get("hub") or {}).get("enabled"), False)
+        if provider in {"probe_agent", "hybrid"} and not agents and not hub_enabled:
+            raise ConfigError(
+                "detect.provider 需要探针，但 detect.probe_agent 为空"
+                "（家宽机器请改用反向模式：detect.hub.enabled: true）"
+            )
+        if provider == "hub" and not hub_enabled:
+            raise ConfigError("provider: hub 需要同时设置 detect.hub.enabled: true")
 
         default_layers = ["icmp", "tls"]
         layers_raw = raw.get("layers", default_layers)
@@ -252,6 +262,9 @@ class DetectConfig:
             probe_agents=agents,
             checkhost_max_nodes=_as_int(raw.get("checkhost_max_nodes"), 6),
             checkhost_timeout=_as_int(raw.get("checkhost_timeout"), 20),
+            hub_enabled=_as_bool((raw.get("hub") or {}).get("enabled"), False),
+            hub_port=_as_int((raw.get("hub") or {}).get("port"), 8790),
+            hub_token=str((raw.get("hub") or {}).get("token") or "").strip(),
         )
 
 

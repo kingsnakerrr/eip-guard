@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from .bot import BotApp
 from .config import Config, ConfigError
 from .engine import Engine
+from .hub import ProbeHub
 from .log import setup_logging
 from .state import Settings, StateStore
 
@@ -91,12 +93,24 @@ async def amain(args: argparse.Namespace) -> int:
             print("  ⚠ 判定需要国内 + 国外各至少一台探针，当前配置无法对比")
         return 0
 
+    # 反向探针 hub：家宽机器主动连过来，无需公网 IP/端口转发
+    hub: ProbeHub | None = None
+    if cfg.detect.hub_enabled:
+        hub_token = cfg.detect.hub_token or os.getenv("PROBE_AGENT_TOKEN", "")
+        if not hub_token:
+            print("配置错误：detect.hub.enabled 需要 detect.hub.token 或 PROBE_AGENT_TOKEN", file=sys.stderr)
+            return 2
+        hub = ProbeHub(hub_token, port=cfg.detect.hub_port)
+
     bot: BotApp | None = None
     if not args.no_bot:
         bot = BotApp(cfg, None, store, settings)
-    engine = Engine(cfg, store, settings, notifier=bot.notify if bot else None)
+    engine = Engine(cfg, store, settings, notifier=bot.notify if bot else None, hub=hub)
     if bot:
         bot.engine = engine
+
+    if hub is not None:
+        await hub.start()
 
     if args.once:
         for target in cfg.targets:
@@ -111,6 +125,8 @@ async def amain(args: argparse.Namespace) -> int:
             if probe:
                 for node in probe.nodes:
                     print(f"  {node.brief()}")
+        if hub is not None:
+            await hub.close()
         await engine.close()
         return 0
 
@@ -165,6 +181,8 @@ async def amain(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001
             pass
     store.save()
+    if hub is not None:
+        await hub.close()
     await engine.close()
     return 0
 
