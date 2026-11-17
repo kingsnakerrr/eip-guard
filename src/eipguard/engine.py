@@ -9,7 +9,7 @@ from typing import Any, Awaitable, Callable
 from .cloud.aliyun import AliyunError, AliyunVpc, EipInfo
 from .cloud.cloudflare import Cloudflare, CloudflareError
 from .config import Config, TargetConfig
-from .detect.probe import Detector, ProbeOutcome, build_detector
+from .detect.probe import Detector, ProbeOutcome, Verdict, build_detector
 from .state import Settings, StateStore, TargetState
 
 log = logging.getLogger(__name__)
@@ -83,6 +83,16 @@ class Engine:
     def target_state(self, name: str) -> TargetState:
         return self.store.get(name)
 
+    def switchable_verdicts(self) -> set[Verdict]:
+        """哪些结论允许自动换 IP。可在配置里扩展（例如你确认端口封锁也换）。"""
+        base = {Verdict.IP_BLOCKED}
+        for item in self.cfg.switch.auto_switch_on:
+            try:
+                base.add(Verdict(item))
+            except ValueError:
+                log.warning("switch.auto_switch_on 里有未知结论：%s", item)
+        return base
+
     def auto_enabled(self, name: str) -> bool:
         """全局开关与单目标开关都要开，才不会自动换。"""
         return bool(self.settings.auto and self.store.get(name).auto)
@@ -104,13 +114,16 @@ class Engine:
                 return info
         return await self.aliyun.find_instance_eip(target.instance_id, region_id=region)
 
-    async def _probe(self, ip: str, port: int, names: list[str]) -> ProbeOutcome:
-        sni = names[0] if names else ""
-        return await self.detector.check(ip, port, sni=sni)
+    async def _probe(self, ip: str, port: int, names: list[str], sni: str = "") -> ProbeOutcome:
+        # 优先用目标上的域名做 SNI（TLS 层需要），没配域名再用配置里的 sni
+        server_name = sni or self.cfg.detect.sni or (names[0] if names else "")
+        return await self.detector.check(ip, port, sni=server_name)
 
-    async def probe_once(self, ip: str, port: int, names: list[str] | None = None) -> ProbeOutcome:
+    async def probe_once(
+        self, ip: str, port: int, names: list[str] | None = None, sni: str = ""
+    ) -> ProbeOutcome:
         """对外暴露的一次探测（机器人 /health 使用）。"""
-        return await self._probe(ip, port, names or [])
+        return await self._probe(ip, port, names or [], sni)
 
     # ------------------------------------------------------------------ status
     async def inspect(self, name: str) -> dict[str, Any]:
@@ -138,6 +151,8 @@ class Engine:
             return {"target": target, "state": state, "eip": eip, "probe": None, "error": f"探测异常：{exc}"}
         state.last_check = time.time()
         state.last_reason = probe.reason
+        state.last_verdict = probe.verdict.value
+        state.last_advice = probe.advice
         if probe.ok:
             state.failures = 0
             state.notified_stage = 0
@@ -176,6 +191,9 @@ class Engine:
             return
 
         assert probe is not None
+        state.last_verdict = probe.verdict.value
+        state.last_reason = probe.reason
+        state.last_advice = probe.advice
         if probe.ok:
             if state.failures or state.notified_stage:
                 log.info("%s 恢复正常", name)
@@ -197,18 +215,25 @@ class Engine:
         state.failures += 1
         self.store.save()
         log.warning(
-            "%s 探测失败 %d/%d：%s",
+            "%s 探测异常 %d/%d [%s]：%s",
             name,
             state.failures,
             self.settings.failure_threshold,
+            probe.verdict.value,
             probe.reason,
         )
+
+        # 只有"换 IP 真能解决问题"的结论才继续往下走。
+        # 端口/TLS/数据面被阻断换 IP 无效，只告警，避免白花钱。
+        switchable = probe.verdict in self.switchable_verdicts()
         confirmed = state.failures >= self.settings.failure_threshold
-        if probe.blocked and state.notified_stage < (2 if confirmed else 1):
+        if state.notified_stage < (2 if confirmed else 1):
             state.notified_stage = 2 if confirmed else 1
             self.store.save()
             auto_on = self.auto_enabled(name)
-            if confirmed and not auto_on:
+            if not switchable:
+                kind = "service_down" if probe.verdict is Verdict.DOWN else "block_other"
+            elif confirmed and not auto_on:
                 kind = "auto_disabled"
             else:
                 kind = "blocked_confirmed" if confirmed else "blocked_suspect"
@@ -217,15 +242,19 @@ class Engine:
                     "type": kind,
                     "target": name,
                     "ip": state.current_ip,
+                    "verdict": probe.verdict.value,
+                    "label": probe.label,
+                    "advice": probe.advice,
                     "count": state.failures,
                     "threshold": self.settings.failure_threshold,
                     "detail": probe.reason,
-                    "will_switch": confirmed and auto_on,
+                    "will_switch": confirmed and switchable and auto_on,
                     "auto_off": not auto_on,
+                    "switchable": switchable,
                 }
             )
 
-        if not probe.blocked:
+        if not switchable:
             return
         if not confirmed:
             return

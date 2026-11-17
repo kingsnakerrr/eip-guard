@@ -65,8 +65,14 @@ async def amain(args: argparse.Namespace) -> int:
             detail = await engine.inspect(target.name)
             probe = detail.get("probe")
             eip = detail.get("eip")
-            status = "OK" if probe and probe.ok else ("BLOCKED" if probe and probe.blocked else "UNKNOWN")
-            print(f"{target.name}: {eip.ip if eip else '-'} {status} {probe.reason if probe else detail.get('error')}")
+            verdict = probe.verdict.value.upper() if probe else "UNKNOWN"
+            print(
+                f"{target.name}: {eip.ip if eip else '-'} {verdict} "
+                f"{probe.reason if probe else detail.get('error')}"
+            )
+            if probe:
+                for node in probe.nodes:
+                    print(f"  {node.brief()}")
         await engine.close()
         return 0
 

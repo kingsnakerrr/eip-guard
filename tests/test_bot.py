@@ -133,7 +133,9 @@ async def test_status_command_shows_probe(app):
     await bot.cmd_status(update, FakeCtx(["hk"]))
     text = update.effective_message.all_text
     assert "1.1.1.1" in text
-    assert "连续失败" in text
+    assert "连续异常" in text
+    assert "分层结果" in text
+    assert "TCP" in text
     assert "hk.example.com" in text
 
 
@@ -166,5 +168,36 @@ def test_render_result_contains_steps():
 
 def test_fmt_escapes_html():
     assert fmt.esc("<b>x</b>") == "&lt;b&gt;x&lt;/b&gt;"
-    assert "🚨" in fmt.blocked_text({"target": "t", "ip": "1.1.1.1", "detail": "d", "will_switch": True})
+    text = fmt.blocked_text(
+        {"target": "t", "ip": "1.1.1.1", "detail": "d", "will_switch": True, "verdict": "ip_blocked"}
+    )
+    assert "IP 被墙" in text and "准备更换 IP" in text
     assert "恢复正常" in fmt.recovered_text({"target": "t", "ip": "1.1.1.1"})
+
+
+def test_fmt_port_blocked_says_no_switch():
+    text = fmt.blocked_text(
+        {
+            "target": "t",
+            "ip": "1.1.1.1",
+            "detail": "仅端口被封",
+            "verdict": "port_blocked",
+            "switchable": False,
+            "advice": "换端口",
+        }
+    )
+    assert "换 IP 无效" in text
+    assert "换端口" in text
+    assert "准备更换 IP" not in text
+
+
+def test_fmt_service_down_text():
+    text = fmt.service_down_text({"target": "t", "ip": "1.1.1.1", "detail": "墙外也不通"})
+    assert "不是被墙" in text
+    assert "安全组" in text
+
+
+def test_verdict_definitions_cover_all():
+    text = fmt.verdict_definitions_text()
+    for label in ("IP 被墙", "端口被墙", "TLS 被阻断", "数据面被阻断", "服务不可用"):
+        assert label in text

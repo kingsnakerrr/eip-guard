@@ -8,7 +8,16 @@ import pytest
 from eipguard.cloud.aliyun import EipInfo
 from eipguard.cloud.cloudflare import DnsRecord
 from eipguard.config import Config, TargetConfig
-from eipguard.detect.probe import Attempt, NodeResult, ProbeOutcome
+from eipguard.detect.probe import (
+    LAYER_AUX,
+    LAYER_ICMP,
+    LAYER_TCP,
+    LAYER_TLS,
+    LayerResult,
+    NodeResult,
+    ProbeOutcome,
+    Verdict,
+)
 from eipguard.engine import Engine
 from eipguard.state import Settings, StateStore
 
@@ -129,24 +138,80 @@ class WallDetector(FakeDetector):
         return blocked_outcome() if ip in self.walled else ok_outcome()
 
 
+def _layer(name: str, ok: bool | None, kind: str = "") -> LayerResult:
+    return LayerResult(name, ok, 10.0 if ok else None, kind, "" if ok else kind)
+
+
+def _cn(**layers: LayerResult) -> NodeResult:
+    return NodeResult("cn", "cn", dict(layers))
+
+
+def _us(**layers: LayerResult) -> NodeResult:
+    base = {
+        LAYER_ICMP: _layer(LAYER_ICMP, True),
+        LAYER_TCP: _layer(LAYER_TCP, True),
+        LAYER_TLS: _layer(LAYER_TLS, True),
+    }
+    base.update(layers)
+    return NodeResult("us", "overseas", base)
+
+
 def ok_outcome() -> ProbeOutcome:
-    return ProbeOutcome(True, False, "ok", [NodeResult("cn", "cn", [Attempt(True, 10.0)])])
-
-
-def blocked_outcome() -> ProbeOutcome:
     return ProbeOutcome(
-        False,
-        True,
-        "blocked",
+        Verdict.OK,
+        "探测正常",
         [
-            NodeResult("cn", "cn", [Attempt(False, None, kind="timeout")]),
-            NodeResult("us", "overseas", [Attempt(True, 30.0)]),
+            _cn(**{LAYER_TCP: _layer(LAYER_TCP, True), LAYER_TLS: _layer(LAYER_TLS, True)}),
+            _us(),
         ],
     )
 
 
+def blocked_outcome() -> ProbeOutcome:
+    """能 ping 通但端口全不通 → IP 被墙（用户遇到的真实场景）。"""
+    return ProbeOutcome(
+        Verdict.IP_BLOCKED,
+        "ICMP 能通但端口全部不通，墙外正常 → IP 被墙",
+        [
+            _cn(
+                **{
+                    LAYER_ICMP: _layer(LAYER_ICMP, True),
+                    LAYER_TCP: _layer(LAYER_TCP, False, "timeout"),
+                    LAYER_AUX: _layer(LAYER_AUX, False, "timeout"),
+                }
+            ),
+            _us(),
+        ],
+        "换 IP 有效。",
+    )
+
+
+def port_blocked_outcome() -> ProbeOutcome:
+    return ProbeOutcome(
+        Verdict.PORT_BLOCKED,
+        "节点端口不通但其它端口可连 → 仅端口被封",
+        [
+            _cn(
+                **{
+                    LAYER_TCP: _layer(LAYER_TCP, False, "timeout"),
+                    LAYER_AUX: _layer(LAYER_AUX, True),
+                }
+            ),
+            _us(),
+        ],
+        "换 IP 通常无效且浪费钱。",
+    )
+
+
 def down_outcome() -> ProbeOutcome:
-    return ProbeOutcome(False, False, "down", [NodeResult("cn", "cn", [Attempt(False, kind="timeout")])])
+    return ProbeOutcome(
+        Verdict.DOWN,
+        "墙外也连不上 → 服务故障",
+        [
+            _cn(**{LAYER_TCP: _layer(LAYER_TCP, False, "refused")}),
+            _us(**{LAYER_TCP: _layer(LAYER_TCP, False, "refused")}),
+        ],
+    )
 
 
 def make_cfg(tmp_path: Any, **over: Any) -> Config:

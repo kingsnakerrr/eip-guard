@@ -20,6 +20,8 @@ class TargetState:
     last_check: float = 0.0
     last_ok: float = 0.0
     last_reason: str = ""
+    last_verdict: str = ""
+    last_advice: str = ""
     last_switch: float = 0.0
     last_switch_ok: bool = True
     auto: bool = True

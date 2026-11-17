@@ -42,12 +42,28 @@ detect:
   port: 443
   # 多少秒检查一轮
   interval: 60
-  # 连续多少轮判定为被墙才动作（防抖）
+  # 连续多少轮判定异常才动作（防抖）
   failure_threshold: 3
-  # 单次探测：判定“被墙”所需的失败样本占比，以及最少样本数
+  # 单次探测：判定“异常”所需的失败样本占比，以及最少样本数
   fail_ratio: 0.6
-  min_samples: 2
+  min_samples: 1
   timeout: 6.0
+  # 每个探针每层探测几次（任一次成功即视为该层通）
+  attempts: 2
+  # 分层探测。只测 TCP 会把「能 ping 通但端口全废」误判成正常，所以默认加上 icmp + tls。
+  #   icmp — 判断 IP 还能不能 ping（注意：能 ping 通不代表可用）
+  #   tcp  — 节点端口能否建连（必测）
+  #   tls  — TLS 握手，发现 SNI/证书指纹阻断
+  #   http — TLS 之上真的发一次请求，发现“握手能过、一传数据就断”
+  #   aux  — 探测 aux_ports 里的其它端口，用来区分「整台 IP 被封」还是「只封了一个端口」
+  layers: ["icmp", "tcp", "tls"]
+  # 建议配上：用来区分「IP 被墙」和「只封了 443」。填你机器上实际开放的其它端口
+  #（例如 SSH 22、面板 8443、备用 Web 80）
+  aux_ports: [22, 80]
+  # 需要 http 层时的请求路径
+  http_path: "/"
+  # 固定 SNI；留空则用 target.dns_records 的第一个域名
+  sni: ""
   # 更换后验证
   verify_delay: 20
   verify_attempts: 3
@@ -67,6 +83,10 @@ detect:
 switch:
   # 是否自动更换；机器人里也能开关
   auto: true
+  # 只有这些判定结论才允许自动换 IP。
+  # 默认只有 ip_blocked：端口封锁 / TLS 阻断 / 数据面阻断换 IP 都无效，白花钱。
+  # 想更激进可以写 ["ip_blocked", "port_blocked"]
+  auto_switch_on: ["ip_blocked"]
   # 一次被墙事件最多尝试几个新 IP
   max_attempts: 3
   # 两次更换之间的最小间隔（秒），避免抖动

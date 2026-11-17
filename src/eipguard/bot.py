@@ -25,10 +25,11 @@ log = logging.getLogger(__name__)
 HELP = """<b>EIP Guard</b> · 阿里云 EIP 被墙自动更换
 
 <b>查看</b>
-/status — 全部目标状态（实时探测）
+/status — 全部目标状态（分层探测结果）
 /status &lt;目标&gt; — 单个目标详情
 /ip — 快速看当前 IP
 /probe [目标] — 只做探测，不改动
+/verdict — 各判定类型的定义（被墙 / 封端口 / TLS 阻断 / 故障）
 /history — 最近事件
 
 <b>操作</b>
@@ -41,12 +42,15 @@ HELP = """<b>EIP Guard</b> · 阿里云 EIP 被墙自动更换
 <b>设置</b>
 /settings — 查看
 /set interval 60 — 检查间隔（秒）
-/set threshold 3 — 连续失败几次才换
+/set threshold 3 — 连续异常几次才动作
 /set cooldown 900 — 两次更换最小间隔（秒）
 /set release on|off — 成功后是否释放旧 EIP
 /channel [频道id|off] — 通知频道
 /bind — 把当前聊天设为管理员（仅首次）
 /health — 依赖连通性自检
+
+<b>说明</b>：只有判定为「IP 被墙」才会自动换 IP。封端口、TLS 阻断、数据面阻断
+换 IP 无效，只告警不动作（详情见 /verdict）。
 """
 
 SETTING_KEYS = {
@@ -114,6 +118,8 @@ class BotApp:
             "switch_failed": fmt.switch_failed_text,
             "blocked_confirmed": fmt.blocked_text,
             "blocked_suspect": fmt.blocked_text,
+            "block_other": fmt.blocked_text,
+            "service_down": fmt.service_down_text,
             "recovered": fmt.recovered_text,
             "dns_sync": fmt.dns_text,
             "auto_disabled": fmt.blocked_text,
@@ -254,15 +260,15 @@ class BotApp:
             if not probe:
                 await reply(update, f"{name}: {detail.get('error') or '无探测结果'}")
                 continue
-            icon = "🟢" if probe.ok else ("🔴" if probe.blocked else "🟠")
-            verdict = "正常" if probe.ok else ("判定被墙" if probe.blocked else "异常但不确定是墙")
             text = "\n".join(
                 [
-                    f"{icon} <b>{fmt.esc(name)}</b> · {fmt.esc(eip.ip if eip else '-')}",
-                    f"结论：{verdict}",
+                    f"{probe.icon} <b>{fmt.esc(name)}</b> · {fmt.esc(eip.ip if eip else '-')}",
+                    f"结论：<b>{fmt.esc(probe.label)}</b>",
                     fmt.probe_lines(probe),
+                    fmt.layer_table(probe),
+                    f"💡 {fmt.esc(probe.advice)}" if probe.advice else "",
                 ]
-            )
+            ).strip()
             await reply(update, text, parse_mode=ParseMode.HTML)
 
     async def cmd_switch(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -341,9 +347,16 @@ class BotApp:
         if not await self._guard(update):
             return
         states = {t.name: self.store.get(t.name).auto for t in self.cfg.targets}
-        await reply(update, 
-            fmt.settings_text(self.settings, states), parse_mode=ParseMode.HTML
+        await reply(
+            update,
+            fmt.settings_text(self.settings, states, self.cfg.switch.auto_switch_on),
+            parse_mode=ParseMode.HTML,
         )
+
+    async def cmd_verdict(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        await reply(update, fmt.verdict_definitions_text(), parse_mode=ParseMode.HTML)
 
     async def cmd_set(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
@@ -611,6 +624,7 @@ class BotApp:
         app.add_handler(CommandHandler("switch", self.cmd_switch))
         app.add_handler(CommandHandler("dns", self.cmd_dns))
         app.add_handler(CommandHandler("settings", self.cmd_settings))
+        app.add_handler(CommandHandler("verdict", self.cmd_verdict))
         app.add_handler(CommandHandler("set", self.cmd_set))
         app.add_handler(CommandHandler("autoswitch", self.cmd_autoswitch))
         app.add_handler(CommandHandler("auto", self.cmd_auto))

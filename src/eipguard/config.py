@@ -162,9 +162,16 @@ class DetectConfig:
     interval: int = 60
     failure_threshold: int = 3
     fail_ratio: float = 0.6
-    min_samples: int = 2
+    min_samples: int = 1
     timeout: float = 6.0
-    tls_check: bool = True
+    attempts: int = 2
+    # 分层检测：icmp / tcp / tls / http / aux。tcp 一定测，其余按需加。
+    layers: list[str] = field(default_factory=lambda: ["icmp", "tcp", "tls"])
+    # 用来判断"整台 IP 被封"还是"只封了这个端口"（例如 80,22,8443）
+    aux_ports: list[int] = field(default_factory=list)
+    # 需要 http 层时请求的路径（配合 tls 之上发真实请求）
+    http_path: str = "/"
+    sni: str = ""
     verify_delay: int = 20
     verify_attempts: int = 3
     verify_success_needed: int = 1
@@ -180,15 +187,46 @@ class DetectConfig:
         agents = parse_agents(raw.get("probe_agent"))
         if provider in {"probe_agent", "hybrid"} and not agents:
             raise ConfigError("detect.provider 需要探针，但 detect.probe_agent 为空")
+
+        default_layers = ["icmp", "tcp", "tls"]
+        layers_raw = raw.get("layers", default_layers)
+        if isinstance(layers_raw, str):
+            layers_raw = [x.strip().lower() for x in layers_raw.replace("，", ",").split(",") if x.strip()]
+        layers: list[str] = []
+        for layer in layers_raw or []:
+            name = str(layer).strip().lower()
+            if name not in {"icmp", "tcp", "tls", "http", "aux"}:
+                raise ConfigError(f"detect.layers 里有未知层：{name}")
+            if name not in layers:
+                layers.append(name)
+        if "tcp" not in layers:
+            layers.insert(0, "tcp")
+
+        aux_raw = raw.get("aux_ports") or []
+        if isinstance(aux_raw, str):
+            aux_raw = [x for x in aux_raw.replace("，", ",").split(",") if x.strip()]
+        aux_ports: list[int] = []
+        for item in aux_raw:
+            try:
+                port = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535 and port != _as_int(raw.get("port"), default_port):
+                aux_ports.append(port)
+
         return cls(
             provider=provider,
             port=_as_int(raw.get("port"), default_port),
             interval=max(15, _as_int(raw.get("interval"), 60)),
             failure_threshold=max(1, _as_int(raw.get("failure_threshold"), 3)),
             fail_ratio=min(1.0, max(0.0, _as_float(raw.get("fail_ratio"), 0.6))),
-            min_samples=max(1, _as_int(raw.get("min_samples"), 2)),
+            min_samples=max(1, _as_int(raw.get("min_samples"), 1)),
             timeout=_as_float(raw.get("timeout"), 6.0),
-            tls_check=_as_bool(raw.get("tls_check"), True),
+            attempts=max(1, min(5, _as_int(raw.get("attempts"), 2))),
+            layers=layers,
+            aux_ports=aux_ports,
+            http_path=str(raw.get("http_path") or "/"),
+            sni=str(raw.get("sni") or "").strip(),
             verify_delay=max(0, _as_int(raw.get("verify_delay"), 20)),
             verify_attempts=max(1, _as_int(raw.get("verify_attempts"), 3)),
             verify_success_needed=max(1, _as_int(raw.get("verify_success_needed"), 1)),
@@ -208,10 +246,19 @@ class SwitchConfig:
     internet_charge_type: str = ""
     bandwidth_mbps: int | None = None
     isp: str = ""
+    # 哪些结论允许自动换 IP。默认只有 ip_blocked（端口/TLS/数据面封锁换 IP 无效）
+    auto_switch_on: list[str] = field(default_factory=lambda: ["ip_blocked"])
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SwitchConfig":
         bw = raw.get("bandwidth_mbps")
+        allowed = raw.get("auto_switch_on")
+        if allowed is None:
+            verdicts = ["ip_blocked"]
+        elif isinstance(allowed, str):
+            verdicts = [x.strip().lower() for x in allowed.replace("，", ",").split(",") if x.strip()]
+        else:
+            verdicts = [str(x).strip().lower() for x in allowed if str(x).strip()]
         return cls(
             auto=_as_bool(raw.get("auto"), True),
             max_attempts=max(1, _as_int(raw.get("max_attempts"), 3)),
@@ -221,6 +268,7 @@ class SwitchConfig:
             internet_charge_type=str(raw.get("internet_charge_type") or "").strip(),
             bandwidth_mbps=_as_int(bw, 0) or None,
             isp=str(raw.get("isp") or "").strip(),
+            auto_switch_on=verdicts,
         )
 
 
