@@ -94,40 +94,26 @@ Zone Resources 只选你那一个域名。**用 Token，不要用 Global API Key
 
 ## 二、一键安装
 
-### 先上传到 GitHub
-
-```bash
-cd eip-guard
-git init && git add -A
-git commit -m "init"
-git remote add origin git@github.com:你的用户名/eip-guard.git
-git branch -M main && git push -u origin main
-```
-
-然后把 `install.sh` 第 25 行改成你的仓库：
-
-```bash
-REPO="你的用户名/eip-guard"
-```
-
-（不想改脚本就每次运行前加 `REPO=...` 环境变量。）
+仓库地址：https://github.com/kingsnakerrr/eip-guard
 
 ### 装探针（国内、国外各一台）
 
+判定靠「同一端口，国内不通 + 国外通」对比，**两台都要有**。
+
 ```bash
 # 国外机器
-bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh) --probe --zone overseas
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh) --probe --zone overseas
 
 # 国内机器（token 用上面打印的那个）
-bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh) --probe --zone cn --token <token>
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh) --probe --zone cn --token <上面的token>
 ```
 
-脚本自动：装 Python 依赖 → 生成 token → 写 systemd → 启动 → 健康检查 → 放行防火墙 → 打印地址和该填的那行配置。
+脚本自动：装 Python 依赖 → 生成 token → 写 systemd → 启动 → 健康检查 → 放行防火墙 → 打印地址和该填的配置行。
 
 ### 装主程序
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)
 ```
 
 出现菜单：
@@ -148,7 +134,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main
   0) 退出
 ```
 
-选 `1`，然后按提示填 5 步（都有默认值，直接回车即可）：
+选 `1`，按提示填 5 步（都有默认值，直接回车即可）：
 
 1. **Telegram** — Bot Token、你的 chat id、频道 id（可空）
 2. **阿里云** — 账号 1 的 AK/SK + 地域；问你要不要加账号 2
@@ -156,19 +142,19 @@ bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main
 4. **探针** — 国内、国外两个地址 + 共享 token
 5. **实例** — 代号、用哪个账号、实例 ID、业务端口、其它端口、域名
 
-填完自动生成 `.env` + `config.yaml`，做一次配置校验，然后启动服务。
+填完自动生成 `.env` + `config.yaml`，做一次配置校验，然后启动服务。密码类输入不回显。
 
 ### 日常操作
 
 ```bash
-# 同样是这条命令，进入菜单
-bash <(curl -Ls .../install.sh)
+# 同一条命令进菜单
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)
 
 # 或直接用参数
-bash <(curl -Ls .../install.sh) --status      # 看运行状态和最近事件
-bash <(curl -Ls .../install.sh) --log         # 跟踪日志
-bash <(curl -Ls .../install.sh) --update      # 只更新代码，保留配置
-bash <(curl -Ls .../install.sh) --uninstall   # 卸载
+... --status      # 运行状态 + 最近事件
+... --log         # 跟踪日志
+... --update      # 只更新代码，保留配置
+... --uninstall   # 卸载
 ```
 
 ### 非交互安装（批量 / CI）
@@ -183,7 +169,7 @@ ALIYUN_AK_ID_2='LTAI...' ALIYUN_AK_SECRET_2='...' \
 CF_API_TOKEN='...' CF_ZONE_NAME='example.com' \
 PROBE_CN_URL='http://1.1.1.1:8787' PROBE_OS_URL='http://2.2.2.2:8787' \
 PROBE_AGENT_TOKEN='xxx' \
-bash <(curl -Ls .../install.sh) --install --non-interactive
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh) --install --non-interactive
 ```
 
 `TARGETS` 每行：`代号|账号|实例ID|业务端口|其它端口|域名(空格分隔)`，多行用换行或 `;` 分隔。
@@ -193,8 +179,6 @@ bash <(curl -Ls .../install.sh) --install --non-interactive
 ```bash
 bash <(curl -Ls .../install.sh) --pip-index https://pypi.tuna.tsinghua.edu.cn/simple
 ```
-
-或设 `PIP_INDEX` 环境变量。
 
 ### 装完检查
 
@@ -208,14 +192,23 @@ cd /opt/eipguard
 
 ### 绑定管理员
 
-`.env` 里填了 `TG_ADMIN_IDS` 就直接能用。没填的话：私聊机器人发 `/bind 你的口令`（口令在 `.env` 的 `TG_BIND_TOKEN`）。
+`.env` 里填了 `TG_ADMIN_IDS` 就直接能用。没填：私聊机器人发 `/bind 你的口令`（口令在 `.env` 的 `TG_BIND_TOKEN`）。
 
-频道：把机器人拉进频道 → 设为管理员 → 菜单里改配置填 `TG_CHANNEL_ID`，或私聊机器人 `/channel -100xxxxxxxxxx`。
+频道：机器人拉进频道 → 设为管理员 → 配置里填 `TG_CHANNEL_ID`，或私聊机器人 `/channel -100xxxxxxxxxx`。
 
 ### Docker
 
 ```bash
-docker compose up -d --build
+git clone https://github.com/kingsnakerrr/eip-guard.git
+cd eip-guard && docker compose up -d --build
+```
+
+### raw 链接显示旧内容？
+
+`raw.githubusercontent.com` 有约 5 分钟 CDN 缓存。刚推完代码时可能还是旧的，等几分钟或改用：
+
+```bash
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/kingsnakerrr/eip-guard@main/install.sh)
 ```
 
 ---
