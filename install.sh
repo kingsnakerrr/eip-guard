@@ -206,6 +206,7 @@ fetch_source() {
     } >&2
     return 1
   fi
+  tar tzf "$SRC_TMP/src.tgz" >/dev/null 2>&1 || die "下载的文件不是有效 tar 包（可能是网络劫持，换个网络重试）"
   tar xzf "$SRC_TMP/src.tgz" -C "$SRC_TMP" || die "解压失败"
   local root
   root="$(find "$SRC_TMP" -maxdepth 1 -type d -name '*-*' | head -1)"
