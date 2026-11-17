@@ -621,7 +621,12 @@ class BotApp:
 
     # ------------------------------------------------------------ 启动
     def build(self) -> Application:
-        app = Application.builder().token(self.cfg.telegram_token).build()
+        builder = Application.builder().token(self.cfg.telegram_token)
+        # 机器人所在机器连不上 Telegram（国内很常见）时走代理
+        if self.cfg.tg_proxy:
+            builder = builder.proxy(self.cfg.tg_proxy).get_updates_proxy(self.cfg.tg_proxy)
+            log.info("Telegram 使用代理：%s", self.cfg.tg_proxy)
+        app = builder.build()
         self.app = app
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))

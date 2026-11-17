@@ -276,7 +276,7 @@ gen_env_and_config() {
   [ -f "$env_file" ] || fresh=1
 
   if [ "$fresh" = "1" ]; then
-    title "配置向导（共 5 步，直接回车用默认值）"
+    title "配置向导（共 5 组，直接回车用默认值）"
 
     # ---------- Telegram ----------
     msg ""
@@ -290,6 +290,11 @@ gen_env_and_config() {
     [ -z "$tg_channel" ] && tg_channel="$(ask '通知频道 id（可空，形如 -1001234567890）' '')"
     local tg_bind="${TG_BIND_TOKEN:-}"
     [ -z "$tg_bind" ] && tg_bind="$(ask '首次绑定口令（可空）' '')"
+    local tg_proxy="${TG_PROXY:-}"
+    if [ -z "$tg_proxy" ]; then
+      msg "${DIM}   如果这台机器连不上 Telegram（国内机器常见），填个代理${RST}"
+      tg_proxy="$(ask 'Telegram 代理（可空，如 socks5://127.0.0.1:1080）' '')"
+    fi
 
     # ---------- 阿里云 ----------
     msg ""
@@ -389,6 +394,7 @@ gen_env_and_config() {
       echo "TG_ADMIN_IDS=$tg_admins"
       echo "TG_BIND_TOKEN=$tg_bind"
       echo "TG_CHANNEL_ID=$tg_channel"
+      echo "TG_PROXY=$tg_proxy"
       echo ""
       echo "ALIYUN_AK_ID=$ak1"
       echo "ALIYUN_AK_SECRET=$sk1"
@@ -414,6 +420,7 @@ telegram:
   admin_chat_ids: "\${TG_ADMIN_IDS:-}"
   bind_token: "\${TG_BIND_TOKEN:-}"
   channel_id: "\${TG_CHANNEL_ID:-}"
+  proxy: "\${TG_PROXY:-}"
 
 aliyun:
   accounts:
@@ -860,7 +867,7 @@ ${BLD}EIP Guard 安装脚本${RST}
 
 环境变量：
   REPO BRANCH APP_DIR PROBE_DIR PIP_INDEX
-  TG_BOT_TOKEN TG_ADMIN_IDS TG_CHANNEL_ID TG_BIND_TOKEN
+  TG_BOT_TOKEN TG_ADMIN_IDS TG_CHANNEL_ID TG_BIND_TOKEN TG_PROXY
   ALIYUN_AK_ID ALIYUN_AK_SECRET ALIYUN_REGION ALIYUN_NAME
   ALIYUN_AK_ID_2 ALIYUN_AK_SECRET_2
   CF_API_TOKEN CF_ZONE_NAME

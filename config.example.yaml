@@ -9,6 +9,9 @@ telegram:
   bind_token: "${TG_BIND_TOKEN:-}"
   # 通知频道；运行时可用 /channel 覆盖
   channel_id: "${TG_CHANNEL_ID:-}"
+  # 机器人所在机器连不上 Telegram 时的代理（国内机器常见，留空不用）
+  # 例：http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
+  proxy: "${TG_PROXY:-}"
 
 # ---------------- 阿里云账号（可以有多个）----------------
 # target 里用 account: 账号名 指定这台机器在哪个账号下

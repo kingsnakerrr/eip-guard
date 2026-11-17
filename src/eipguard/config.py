@@ -436,6 +436,8 @@ class Config:
     timezone: str = "Asia/Shanghai"
     log_level: str = "INFO"
     bind_token: str = ""
+    # 机器人所在机器连不上 Telegram 时用的代理，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
+    tg_proxy: str = ""
 
     def target(self, name: str) -> TargetConfig:
         for t in self.targets:
@@ -504,4 +506,5 @@ class Config:
             timezone=str(raw.get("timezone") or "Asia/Shanghai"),
             log_level=str(raw.get("log_level") or "INFO"),
             bind_token=str(tg.get("bind_token") or "").strip(),
+            tg_proxy=str(tg.get("proxy") or "").strip(),
         )

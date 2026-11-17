@@ -212,3 +212,18 @@ def test_watch_bot_survives_token_failure(tmp_path):
         assert bot.calls == 2, "第一次失败后应该重试"
 
     asyncio.run(scenario())
+
+
+def test_tg_proxy_parsed(tmp_path):
+    text = BASE.replace(
+        '  admin_chat_ids: "${TG_ADMIN_IDS:-}"',
+        '  admin_chat_ids: "${TG_ADMIN_IDS:-}"\n  proxy: "${TG_PROXY:-}"',
+    )
+    env = ENV + "\nTG_PROXY=socks5://127.0.0.1:1080\n"
+    cfg = Config.load(write(tmp_path, text, env))
+    assert cfg.tg_proxy == "socks5://127.0.0.1:1080"
+
+
+def test_tg_proxy_defaults_empty(tmp_path):
+    cfg = Config.load(write(tmp_path, BASE, ENV))
+    assert cfg.tg_proxy == ""
