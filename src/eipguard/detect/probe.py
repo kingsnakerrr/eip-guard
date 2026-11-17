@@ -587,9 +587,16 @@ def judge(
         )
 
     if not cn:
+        failed = [n for n in nodes if n.error]
+        hint = ""
+        if failed:
+            hint = (
+                "（探针连不上：若探针在家宽后面，需要 Tailscale/frp 打通，"
+                "见 docs/家宽探针方案.md）"
+            )
         return outcome(
             Verdict.UNKNOWN,
-            f"没有国内探针（zone: cn），无法做「国内不通 vs 国外通」的对比：{summary}",
+            f"没有国内探针（zone: cn），无法做「国内不通 vs 国外通」的对比{hint}：{summary}",
         )
     if not outside:
         return outcome(

@@ -180,6 +180,20 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/in
 bash <(curl -Ls .../install.sh) --pip-index https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
+### 国内探针在家宽后面？
+
+如果国内探针装在家用宽带的 PVE/软路由里，国外的主程序通常**访问不到**它（家宽大多没有公网 IP）。
+先用这条命令确认：
+
+```bash
+bash <(curl -Ls .../install.sh) --check-probe http://你的家宽地址:8787 --token 你的token
+```
+
+- 显示 `✓ 探测请求成功` → 直接填地址即可
+- 显示 `✗ TCP 不可达` → 走 Tailscale 或 frp
+
+完整方案（含 Tailscale、frp、CF Tunnel 三种做法）见 **[docs/家宽探针方案.md](docs/家宽探针方案.md)**。
+
 ### 装完检查
 
 ```bash

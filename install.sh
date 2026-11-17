@@ -783,6 +783,86 @@ ensure_firewall() {
 # =====================================================================
 # 状态 / 日志 / 卸载
 # =====================================================================
+check_probe() {
+  # 用法：--check-probe http://ip:8787 --token xxx
+  local url="${1:-}" tok="${2:-}"
+  if [ -z "$url" ]; then
+    url="$(ask '探针地址（http://IP:8787）' '')"
+  fi
+  if [ -z "$url" ]; then
+    err "需要探针地址"
+    return 1
+  fi
+  if [ -z "$tok" ]; then
+    tok="$(ask '探针 token' '')"
+  fi
+
+  title "检测探针连通性"
+  msg "地址：$url"
+  msg ""
+
+  # 1) 网络可达
+  local hostport="${url#*://}"
+  local host="${hostport%%:*}"
+  local port="${hostport##*:}"
+  [ "$port" = "$host" ] && port=8787
+
+  if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+    ok "TCP 可达 ${host}:${port}"
+  else
+    err "TCP 不可达 ${host}:${port}"
+    msg ""
+    msg "可能原因："
+    msg "  · 国内那台没有公网 IP（家宽常见），从国外访问不到"
+    msg "  · 防火墙/安全组没放行 ${port}"
+    msg "  · 地址填错"
+    msg ""
+    msg "解决办法见文档 docs/家宽探针方案.md"
+    return 1
+  fi
+
+  # 2) 服务身份 + token
+  local body
+  body="$(curl -fsS --max-time 6 "${url%/}/health" 2>/dev/null)"
+  if [ -z "$body" ]; then
+    err "/health 没响应，可能不是探针服务，或端口被别的程序占用"
+    return 1
+  fi
+  case "$body" in
+    *'"ok":true'*|*'"ok": true'*) ok "服务正常：$body" ;;
+    *) err "响应异常：$body"; return 1 ;;
+  esac
+
+  # 3) 真正发一次探测请求，验证 token
+  local probe_body
+  probe_body="$(curl -fsS --max-time 20 -X POST "${url%/}/probe" \
+      -H "X-Probe-Token: ${tok}" -H 'Content-Type: application/json' \
+      -d '{"ip":"1.1.1.1","ports":[443],"sni":"one.one.one.one","attempts":1,"layers":["icmp","tls"],"timeout":4}' 2>/dev/null)"
+
+  if [ -z "$probe_body" ]; then
+    err "探测请求无响应"
+    return 1
+  fi
+  case "$probe_body" in
+    *unauthorized*) err "token 不匹配（两台探针要用同一个 token）"; return 1 ;;
+    *'"ok": true'*|*'"ok":true'*) ;;
+    *) err "探测失败：$probe_body"; return 1 ;;
+  esac
+
+  local zone
+  zone="$(printf '%s' "$probe_body" | sed -n 's/.*"zone": *"\([^"]*\)".*/\1/p')"
+  ok "探测请求成功，zone=${zone}"
+  msg ""
+  msg "  返回值：$(printf '%s' "$probe_body" | head -c 200)"
+  msg ""
+  if [ "$zone" = "cn" ]; then
+    msg "  ${GRN}这台是国内探针，判定可用。${RST}"
+  elif [ "$zone" = "overseas" ]; then
+    msg "  ${GRN}这台是国外探针。${RST}"
+  fi
+  return 0
+}
+
 show_status() {
   title "运行状态"
   printf '  主程序 %-14s %b\n' "$SERVICE_MAIN" "$(svc_state "$SERVICE_MAIN")"
@@ -913,6 +993,7 @@ ${BLD}EIP Guard 安装脚本${RST}
   install.sh --probe --zone cn      安装探针（国内）
   install.sh --probe --zone overseas 安装探针（国外）
   install.sh --status | --log | --update | --uninstall
+  install.sh --check-probe http://IP:8787 --token xxx   验证探针能否从本机访问
 
 选项：
   --zone cn|overseas    探针所在位置
@@ -946,11 +1027,15 @@ while [ $# -gt 0 ]; do
     --install|--main) ACTION="install" ;;
     --probe) ACTION="probe" ;;
     --status) ACTION="status" ;;
+    --check-probe)
+      ACTION="check_probe"
+      [ $# -ge 2 ] && case "${2:-}" in http*) CHECK_URL="$2"; shift ;; esac
+      ;;
     --log) ACTION="log" ;;
     --update) ACTION="update" ;;
     --uninstall) ACTION="uninstall" ;;
     --zone) ZONE="${2:-}"; shift ;;
-    --token) PROBE_TOKEN="${2:-}"; shift ;;
+    --token) PROBE_TOKEN="${2:-}"; CHECK_TOKEN="${2:-}"; shift ;;
     --port) PROBE_PORT="${2:-}"; shift ;;
     --dir) APP_DIR="${2:-}"; shift ;;
     --probe-dir) PROBE_DIR="${2:-}"; shift ;;
@@ -967,6 +1052,7 @@ case "$ACTION" in
   install) install_main ;;
   probe) install_probe ;;
   status) show_status ;;
+  check_probe) check_probe "${CHECK_URL:-}" "${CHECK_TOKEN:-}" ;;
   log) show_log ;;
   update) do_update ;;
   uninstall) do_uninstall ;;
