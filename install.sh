@@ -19,8 +19,8 @@ set -o pipefail
 # =====================================================================
 # 可修改的默认值
 # =====================================================================
-# ★ 上传 GitHub 后，把下面改成你的 用户名/仓库名 ★
-REPO="${REPO:-}"
+# ★ 源码仓库（已填好，换仓库时改这里）★
+REPO="${REPO:-kingsnakerrr/eip-guard}"
 BRANCH="${BRANCH:-main}"
 APP_DIR="${APP_DIR:-/opt/eipguard}"
 PROBE_DIR="${PROBE_DIR:-/opt/eip-probe}"
@@ -202,7 +202,7 @@ fetch_source() {
       msg ""
       msg "当前 REPO = ${BLD}${REPO}${RST}"
       msg "先上传项目到 GitHub，然后这样运行："
-      msg "  ${DIM}REPO=你的用户名/eip-guard bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh)${RST}"
+      msg "  ${DIM}REPO=kingsnakerrr/eip-guard bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)${RST}"
     } >&2
     return 1
   fi
@@ -836,11 +836,11 @@ usage() {
   cat <<EOF
 ${BLD}EIP Guard 安装脚本${RST}
 
-  ${BLD}bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh)${RST}
+  ${BLD}bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)${RST}
       交互菜单（推荐）
 
-  ${BLD}REPO=你的用户名/eip-guard bash <(curl -Ls .../install.sh)${RST}
-      不改脚本、临时指定仓库
+  install.sh --probe --zone cn        装国内探针
+  install.sh --probe --zone overseas  装国外探针
 
   install.sh --install              安装 / 更新主程序
   install.sh --probe --zone cn      安装探针（国内）
@@ -895,22 +895,6 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-
-# 没配 REPO 且不是本地源码运行时，明确告诉用户怎么改
-if [ -z "$REPO" ]; then
-  if ! { self="${BASH_SOURCE[0]}"; case "$self" in /dev/*|/proc/*) false ;; *) [ -f "$(dirname "$self")/src/eipguard/__init__.py" ] ;; esac; }; then
-    err "脚本里的 REPO 还没配置（当前为空）。"
-    msg ""
-    msg "这是从网络拉取的安装脚本，需要知道源码仓库地址。两种办法："
-    msg "  1) 用环境变量指定（推荐先这样试）："
-    msg "     ${DIM}REPO=你的用户名/eip-guard bash <(curl -Ls .../install.sh)${RST}"
-    msg "  2) 把本脚本第 25 行的 REPO= 改成你的仓库，再推送到 GitHub"
-    msg ""
-    msg "还没上传项目？先把整个 eip-guard 目录 push 到 GitHub，再用 raw 链接运行。"
-    exit 1
-  fi
-fi
-REPO="${REPO:-local/none}"
 
 case "$ACTION" in
   install) install_main ;;
