@@ -187,3 +187,28 @@ def test_probe_agents_zones(tmp_path):
         ("cn", "cn1"),
         ("overseas", "os1"),
     ]
+
+
+def test_watch_bot_survives_token_failure(tmp_path):
+    """Telegram token 无效时，监控不能停。"""
+    import asyncio
+
+    from eipguard.__main__ import watch_bot
+
+    class BrokenBot:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("The token was rejected by the server.")
+            raise asyncio.CancelledError
+
+    async def scenario() -> None:
+        bot = BrokenBot()
+        with pytest.raises(asyncio.CancelledError):
+            await watch_bot(bot, retry_delay=0.01)
+        assert bot.calls == 2, "第一次失败后应该重试"
+
+    asyncio.run(scenario())

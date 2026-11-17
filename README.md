@@ -92,83 +92,130 @@ Zone Resources 只选你那一个域名。**用 Token，不要用 Global API Key
 
 ---
 
-## 二、快速开始
+## 二、一键安装
 
-### 1. 两台探针（一键）
-
-```bash
-# 在墙外 VPS 上
-git clone <仓库> && cd eip-guard
-sudo ./install.sh --probe --zone overseas
-
-# 在墙内 VPS 上
-sudo ./install.sh --probe --zone cn --token <上面打印的 token>
-```
-
-脚本会自动：装 aiohttp → 生成/沿用 token → 写 systemd → 启动 → 打印健康检查和你该填进主程序的那行 URL。
-
-两台必须用**同一个 token**。自测：
+### 先上传到 GitHub
 
 ```bash
-curl -s http://127.0.0.1:8787/health
-# {"ok": true, "zone": "cn", ...}
+cd eip-guard
+git init && git add -A
+git commit -m "init"
+git remote add origin git@github.com:你的用户名/eip-guard.git
+git branch -M main && git push -u origin main
 ```
 
-### 2. 主程序（一键）
+然后把 `install.sh` 第 25 行改成你的仓库：
 
 ```bash
-sudo ./install.sh
+REPO="你的用户名/eip-guard"
 ```
 
-脚本会自动：建 venv → 装依赖 → 生成 `config.yaml` 和 `.env` → 建 `eipguard` 用户 → 注册 systemd（**不自动启动**，等你填完配置）。
+（不想改脚本就每次运行前加 `REPO=...` 环境变量。）
 
-然后填两处：
+### 装探针（国内、国外各一台）
 
 ```bash
-sudo -e /opt/eipguard/.env        # 密钥 + 两台探针地址
-sudo -e /opt/eipguard/config.yaml # 账号、实例、域名、端口
+# 国外机器
+bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh) --probe --zone overseas
+
+# 国内机器（token 用上面打印的那个）
+bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh) --probe --zone cn --token <token>
 ```
 
-校验 + 试跑（只探测，不改任何东西）：
+脚本自动：装 Python 依赖 → 生成 token → 写 systemd → 启动 → 健康检查 → 放行防火墙 → 打印地址和该填的那行配置。
+
+### 装主程序
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/eip-guard/main/install.sh)
+```
+
+出现菜单：
+
+```
+╭──────────────────────────────────────────╮
+│  EIP Guard · 阿里云 EIP 被墙自动更换       │
+╰──────────────────────────────────────────╯
+  主程序 未安装    探针 未安装
+
+  1) 安装 / 更新主程序
+  2) 安装 / 更新探针（国内或国外）
+  3) 查看状态
+  4) 查看日志
+  5) 编辑配置 / 重启
+  6) 更新代码（保留配置）
+  7) 卸载
+  0) 退出
+```
+
+选 `1`，然后按提示填 5 步（都有默认值，直接回车即可）：
+
+1. **Telegram** — Bot Token、你的 chat id、频道 id（可空）
+2. **阿里云** — 账号 1 的 AK/SK + 地域；问你要不要加账号 2
+3. **Cloudflare** — API Token、域名
+4. **探针** — 国内、国外两个地址 + 共享 token
+5. **实例** — 代号、用哪个账号、实例 ID、业务端口、其它端口、域名
+
+填完自动生成 `.env` + `config.yaml`，做一次配置校验，然后启动服务。
+
+### 日常操作
+
+```bash
+# 同样是这条命令，进入菜单
+bash <(curl -Ls .../install.sh)
+
+# 或直接用参数
+bash <(curl -Ls .../install.sh) --status      # 看运行状态和最近事件
+bash <(curl -Ls .../install.sh) --log         # 跟踪日志
+bash <(curl -Ls .../install.sh) --update      # 只更新代码，保留配置
+bash <(curl -Ls .../install.sh) --uninstall   # 卸载
+```
+
+### 非交互安装（批量 / CI）
+
+```bash
+TARGETS='hk-main|main|i-j6cxxx|443|22 80|hk.example.com api.example.com
+sg-second|second|i-t4nxxx|443|22|sg.example.com' \
+TG_BOT_TOKEN='123:abc' \
+TG_ADMIN_IDS='12345678' \
+ALIYUN_AK_ID='LTAI...' ALIYUN_AK_SECRET='...' \
+ALIYUN_AK_ID_2='LTAI...' ALIYUN_AK_SECRET_2='...' \
+CF_API_TOKEN='...' CF_ZONE_NAME='example.com' \
+PROBE_CN_URL='http://1.1.1.1:8787' PROBE_OS_URL='http://2.2.2.2:8787' \
+PROBE_AGENT_TOKEN='xxx' \
+bash <(curl -Ls .../install.sh) --install --non-interactive
+```
+
+`TARGETS` 每行：`代号|账号|实例ID|业务端口|其它端口|域名(空格分隔)`，多行用换行或 `;` 分隔。
+
+### 国内 pip 慢
+
+```bash
+bash <(curl -Ls .../install.sh) --pip-index https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+或设 `PIP_INDEX` 环境变量。
+
+### 装完检查
 
 ```bash
 cd /opt/eipguard
-.venv/bin/python -m eipguard -c config.yaml --check-config
-.venv/bin/python -m eipguard -c config.yaml --once
+.venv/bin/python -m eipguard -c config.yaml --check-config   # 配置对不对
+.venv/bin/python -m eipguard -c config.yaml --once           # 判定对不对（不改任何东西）
 ```
 
-`--once` 会输出每个目标的判定结论和国内外端口对照，确认判对了再启动：
+`--once` 会打印每个目标的国内外端口对照和结论，确认判对了再放心用。
+
+### 绑定管理员
+
+`.env` 里填了 `TG_ADMIN_IDS` 就直接能用。没填的话：私聊机器人发 `/bind 你的口令`（口令在 `.env` 的 `TG_BIND_TOKEN`）。
+
+频道：把机器人拉进频道 → 设为管理员 → 菜单里改配置填 `TG_CHANNEL_ID`，或私聊机器人 `/channel -100xxxxxxxxxx`。
+
+### Docker
 
 ```bash
-sudo systemctl start eipguard
-sudo journalctl -u eipguard -f
-```
-
-### 3. 绑定管理员
-
-`.env` 里先填 `TG_ADMIN_IDS`（你的数字 id）最省事。若留空：
-
-1. 在 `config.yaml` 的 `telegram.bind_token` 设一个口令
-2. 私聊机器人发送 `/bind 你的口令`
-3. 机器人回复 chat id，把它写进 `TG_ADMIN_IDS` 更稳妥
-
-设置频道：把机器人拉进频道 → 设为管理员 → 要么在 `.env` 填 `TG_CHANNEL_ID`，要么私聊机器人 `/channel -100xxxxxxxxxx`。
-
-### 手动安装 / Docker
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/pip install -e .
-.venv/bin/python -m eipguard -c config.yaml
-# 或
 docker compose up -d --build
-```
-
-### 卸载
-
-```bash
-sudo ./install.sh --uninstall            # 主程序（保留配置和数据）
-sudo ./install.sh --probe --uninstall    # 探针
 ```
 
 ---
@@ -374,7 +421,8 @@ detect:
 
 ```
 src/eipguard/
-  config.py      # YAML + ${ENV} 解析、校验
+  __main__.py    # 启动、信号处理；Telegram 挂了不影响监控
+  config.py      # YAML + ${ENV} 解析、校验、多账号
   cloud/aliyun.py    # EIP 分配/绑定/解绑/释放（异步包装、重试）
   cloud/cloudflare.py # A 记录查询/更新/创建
   detect/probe.py    # 探针客户端、check-host、判定逻辑（国内外同端口对比）
@@ -383,6 +431,7 @@ src/eipguard/
   state.py       # 状态与动态设置持久化
   fmt.py         # 消息渲染
 probe_agent/server.py   # 探针（国内/国外各一台，仅需 aiohttp）
+install.sh              # 一键安装 / 菜单 / 卸载
 docs/判定规则.md        # 为什么不能靠 22 端口判断
 ```
 
@@ -403,3 +452,7 @@ docs/判定规则.md        # 为什么不能靠 22 端口判断
 | 频道收不到 | 机器人不是频道管理员；或 `/channel` 没设 |
 | 新 IP 一换就被墙 | 该地域 IP 段被重点照顾，多设 `max_attempts`，或换地域 |
 | 想人工复核结论 | 告警里有 ping.pe 链接，点开对比国内外结果 |
+| 装完服务起不来 | `journalctl -u eipguard -n 50`；配置错会直接报在哪一行 |
+| 提示 `REPO 还没配置` | 改 `install.sh` 里的 `REPO=`，或运行时加 `REPO=用户名/仓库` |
+| 探针 8787 起不来 | 端口被占：`ss -lntp | grep 8787`，换 `--port 18787` |
+| Telegram token 无效 | 服务仍会运行（监控不停），只是收不到消息；修 `.env` 后重启 |

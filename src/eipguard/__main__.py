@@ -16,6 +16,32 @@ from .state import Settings, StateStore
 log = logging.getLogger("eipguard")
 
 
+async def watch_bot(bot: Any, retry_delay: float = 30.0) -> None:
+    """运行 Telegram 机器人；异常时只记录并重试，绝不影响 IP 监控。
+
+    常见失败：token 失效、网络被墙（Telegram 本身也被墙）、Telegram 侧限流。
+    这些都不该让换 IP 逻辑停摆。
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await bot.run()
+            return  # 正常返回 = 被要求停止
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("Telegram 机器人异常（第 %d 次）：%s: %s", attempt, type(exc).__name__, exc)
+            if "InvalidToken" in type(exc).__name__:
+                log.error("Bot Token 无效，请检查 .env 的 TG_BOT_TOKEN。监控仍在运行。")
+            else:
+                log.warning("%.0fs 后重启机器人（监控不受影响）", retry_delay)
+            try:
+                await asyncio.sleep(retry_delay)
+            except asyncio.CancelledError:
+                raise
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="eipguard", description="阿里云 EIP 被墙自动更换 + CF 解析 + TG 机器人")
     ap.add_argument("-c", "--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")
@@ -103,9 +129,10 @@ async def amain(args: argparse.Namespace) -> int:
     monitor = asyncio.create_task(engine.monitor_loop(), name="monitor")
     bot_task: asyncio.Task[None] | None = None
     if bot:
-        bot_task = asyncio.create_task(bot.run(), name="telegram")
+        bot_task = asyncio.create_task(watch_bot(bot), name="telegram")
     stop_task = asyncio.create_task(stop.wait(), name="stop")
 
+    # 关键：Telegram 挂了不能让监控跟着停。监控（保护 IP）必须一直活着。
     tasks: list[asyncio.Task[Any]] = [monitor, stop_task]
     if bot_task:
         tasks.append(bot_task)
@@ -117,6 +144,12 @@ async def amain(args: argparse.Namespace) -> int:
             continue
         if error and not isinstance(error, asyncio.CancelledError):
             log.error("任务 %s 异常退出：%s", task.get_name(), error, exc_info=error)
+        if task is monitor and not stop.is_set():
+            log.error("监控任务退出，但机器人仍在运行；这是 bug，请提交 issue")
+    if not monitor.done():
+        log.warning("Telegram 机器人已退出，但监控继续运行（IP 保护不受影响）")
+        # 只等监控和停止信号，不再因为 bot 退出而整体退出
+        await asyncio.wait({monitor, stop_task}, return_when=asyncio.FIRST_COMPLETED)
 
     log.info("正在关闭…")
     for pending in (monitor, bot_task, stop_task):
