@@ -441,6 +441,22 @@ do_update() {
     ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --migrate ) || warn "迁移失败，看 config.yaml.bak"
   fi
 
+  # 配置是新的但 .env 里还有第一版的 AK/CF —— 提示可以一键导入
+  local imported=0
+  if [ -f "$APP_DIR/.env" ]; then
+    local ak cf
+    ak="$(grep -E '^ALIYUN_AK_ID=' "$APP_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r\"')"
+    cf="$(grep -E '^CF_API_TOKEN=' "$APP_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r\"')"
+    if [ -n "$ak" ] && ! grep -q "access_key_id" "$APP_DIR/config.yaml" 2>/dev/null; then
+      info ".env 里还有第一版的阿里云 AK，可以一键导入"
+      imported=1
+    fi
+    if [ -n "$cf" ] && ! grep -q 'api_token: "' "$APP_DIR/config.yaml" 2>/dev/null; then
+      info ".env 里还有 Cloudflare Token，可以一键导入"
+      imported=1
+    fi
+  fi
+
   info "校验"
   ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --check-config ) || {
     warn "配置有问题，服务未重启。修好后 systemctl restart $SERVICE"
@@ -456,9 +472,34 @@ SH
 
   if has_systemd; then svc_start "$SERVICE"; fi
   ok "升级完成"
+
+  # 如实统计现在有什么
+  local n_acc n_target n_cf
+  n_acc="$(grep -c '^  - name:' "$APP_DIR/config.yaml" 2>/dev/null | head -1)"
+  n_acc="${n_acc:-0}"
+  n_target="$(awk '/^targets:/{f=1;next} f&&/^  - name:/{c++} END{print c+0}' "$APP_DIR/config.yaml" 2>/dev/null)"
+  if grep -q 'api_token: ""' "$APP_DIR/config.yaml" 2>/dev/null; then n_cf=0; else n_cf=1; fi
+
   echo
-  msg "  ${BLD}原来配的账号、实例、域名都还在${RST}（备份在 ${APP_DIR}/config.yaml.bak）"
-  msg "  去看一眼：${BLD}eipguard --check-config${RST}"
+  if [ "${n_acc:-0}" -eq 0 ] || [ "${n_target:-0}" -eq 0 ] || [ "$n_cf" -eq 0 ]; then
+    msg "  ${BLD}还缺这些配置，需要补一下：${RST}"
+    [ "${n_acc:-0}" -eq 0 ] && msg "    · 阿里云账号：${DIM}eipguard account add main AK SK cn-hongkong${RST}"
+    if [ "$n_cf" -eq 0 ]; then
+      msg "    · Cloudflare：${DIM}eipguard cf CF_TOKEN 你的域名.com${RST}"
+    fi
+    [ "${n_target:-0}" -eq 0 ] && msg "    · 实例：${DIM}eipguard target add hk-main main i-xxxx hk.example.com${RST}"
+    echo
+    msg "  也可以在 Telegram 里：/account add → /cf → /target add"
+    if [ "$imported" = "1" ]; then
+      msg "  ${BLD}或者一条命令自动导入 .env 里的旧密钥：${RST}"
+      msg "    ${DIM}eipguard --import-env${RST}"
+    fi
+  else
+    ok "账号 ${n_acc} 个 · 实例 ${n_target} 台 · Cloudflare 已配置"
+    msg "  备份：${APP_DIR}/config.yaml.bak"
+  fi
+  echo
+  msg "  校验：${BLD}eipguard --check-config${RST}"
 }
 
 do_uninstall() {

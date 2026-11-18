@@ -251,3 +251,14 @@ def test_legacy_migrate_saves_new_format(tmp_path):
 def test_new_format_not_treated_as_legacy(tmp_path):
     cfg = Config.load(write(tmp_path, BASE, ENV))
     assert cfg.legacy_migrated == []
+
+
+def test_import_env_helper_skips_placeholders():
+    """确认占位符检测不会把真密钥误判为占位符。"""
+    from eipguard.__main__ import usable
+
+    assert usable("LTAI5tAbCdEf123456") is True
+    assert usable("your_bot_token") is False
+    assert usable("LTAI5txxxxxxxxxxxxxxxx") is False
+    assert usable("change-me-to-a-long-random-string") is False
+    assert usable("") is False

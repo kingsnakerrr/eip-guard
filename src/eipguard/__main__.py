@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 from typing import Any
 
 from .bot import BotApp
@@ -55,10 +56,114 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="把第一版配置改写成新格式（会先备份）",
     )
+    ap.add_argument(
+        "--import-env",
+        action="store_true",
+        help="从 .env 导入第一版残留的 AK/SK/CF Token（已配置的跳过）",
+    )
     # 子命令：account / target / cf（命令行管理，替代 TG 交互）
     ap.add_argument("command", nargs="?", help="account | target | cf")
     ap.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     return ap.parse_args(argv)
+
+
+def usable(value: str) -> bool:
+    """排除 .env 模板里的占位符，避免把 your_bot_token 当成真密钥。"""
+    if not value:
+        return False
+    lowered = value.lower()
+    return not any(
+        marker in lowered
+        for marker in ("your_", "xxxxx", "change-me", "abc-def", "example.com", "你的")
+    )
+
+
+async def import_env(cfg: Config, env_file: str | None) -> int:
+    """把 .env 里第一版的 ALIYUN_AK_* / CF_* 导入到 config.yaml。
+
+    第一版把密钥放在 .env，新版放在 config.yaml。升级后可能两边不同步。
+    """
+    from dotenv import dotenv_values
+
+    path = Path(env_file).expanduser().resolve() if env_file else cfg.path.parent / ".env"
+    if not path.exists():
+        print(f"找不到 {path}", file=sys.stderr)
+        return 2
+    env = {k: (v or "").strip() for k, v in dotenv_values(path).items()}
+
+    changed: list[str] = []
+
+    # 账号 1
+    if not cfg.accounts:
+        ak, sk = env.get("ALIYUN_AK_ID", ""), env.get("ALIYUN_AK_SECRET", "")
+        if usable(ak) and sk and not sk.startswith("xxxx"):
+            region = env.get("ALIYUN_REGION") or "cn-hongkong"
+            from .config import Account
+
+            acc = Account(name="main", access_key_id=ak, access_key_secret=sk, region=region)
+            client = Engine(cfg).make_client(acc)
+            try:
+                eips = await client.describe_eips()
+                cfg.accounts["main"] = acc
+                changed.append(f"阿里云账号 main（{region}，该账号已有 {len(eips)} 个 EIP）")
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ .env 里的 AK 验证失败，跳过：{exc}")
+        # 账号 2
+        ak2, sk2 = env.get("ALIYUN_AK_ID_2", ""), env.get("ALIYUN_AK_SECRET_2", "")
+        if usable(ak2) and sk2 and not sk2.startswith("xxxx"):
+            from .config import Account
+
+            acc2 = Account(name="second", access_key_id=ak2, access_key_secret=sk2, region=region)
+            client2 = Engine(cfg).make_client(acc2)
+            try:
+                await client2.describe_eips()
+                cfg.accounts["second"] = acc2
+                changed.append(f"阿里云账号 second（{acc2.region}）")
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ .env 里的第二个 AK 验证失败，跳过：{exc}")
+
+    # Cloudflare
+    if not cfg.cloudflare.api_token or not (cfg.cloudflare.zone_name or cfg.cloudflare.zone_id):
+        token = env.get("CF_API_TOKEN", "")
+        zone = env.get("CF_ZONE_NAME", "")
+        if not usable(zone):
+            zone = ""
+        if usable(token):
+            from .cloud.cloudflare import Cloudflare, CloudflareError
+
+            cf = Cloudflare(token, zone_name=zone or None or "")
+            try:
+                if not zone:
+                    print("⚠️ .env 里没有可用的 CF_ZONE_NAME，只能导入 Token，域名请用 eipguard cf 补")
+                else:
+                    zone_id = await cf.resolve_zone_id()
+                    cfg.cloudflare.api_token = token
+                    cfg.cloudflare.zone_name = zone
+                    cfg.cloudflare.zone_id = zone_id
+                    changed.append(f"Cloudflare（{zone}）")
+            except CloudflareError as exc:
+                print(f"⚠️ CF Token 验证失败，跳过：{exc}")
+            finally:
+                await cf.close()
+
+    if not changed:
+        print("没有可导入的内容（已配置的都跳过了）")
+        print("如果 .env 里还是占位符，请手动设置：")
+        print("  eipguard account add main 你的AK 你的SK cn-hongkong")
+        print("  eipguard cf 你的CF_TOKEN 你的域名.com")
+        return 1
+
+    cfg.save()
+    print("✅ 已从 .env 导入：")
+    for item in changed:
+        print(f"    · {item}")
+    print()
+    print("下一步：")
+    if not cfg.targets:
+        print("  添加实例：eipguard target add hk-main main i-xxxx hk.example.com")
+    print("  校验：eipguard --check-config")
+    print("  重启：systemctl restart eipguard")
+    return 0
 
 
 async def handle_command(args: argparse.Namespace, cfg: Config) -> int:
@@ -359,6 +464,9 @@ async def amain(args: argparse.Namespace) -> int:
         print("验证：eipguard --check-config")
         print("然后：systemctl restart eipguard")
         return 0
+
+    if args.import_env:
+        return await import_env(cfg, args.env)
 
     if args.command in {"account", "target", "cf", "bind"}:
         return await handle_command(args, cfg)
