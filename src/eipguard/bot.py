@@ -157,7 +157,7 @@ class BotApp:
             update,
             "⛔ 未授权。\n"
             f"你的 chat id：<code>{chat_id}</code>\n"
-            "管理员在服务器上执行：<code>eipguard bind " + str(chat_id) + "</code>\n"
+            "管理员在服务器上执行：<code>eipguard --bind " + str(chat_id) + "</code>\n"
             "或私聊机器人发 /bind 口令",
             parse_mode=ParseMode.HTML,
         )
@@ -212,7 +212,7 @@ class BotApp:
             await reply(update, f"✅ 已绑定管理员：<code>{chat.id}</code>", parse_mode=ParseMode.HTML)
             return ConversationHandler.END
         if self.admin_ids and not self.cfg.bind_token:
-            await reply(update, "已有管理员，且没设绑定口令。请管理员在服务器执行 eipguard bind " + str(chat.id))
+            await reply(update, "已有管理员，且没设绑定口令。请管理员在服务器执行：eipguard --bind " + str(chat.id))
             return ConversationHandler.END
         await reply(update, "发送绑定口令（config.yaml 里 telegram.bind_token）：")
         return ASK_BIND

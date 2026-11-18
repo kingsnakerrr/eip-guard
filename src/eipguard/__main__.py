@@ -63,6 +63,23 @@ async def handle_command(args: argparse.Namespace, cfg: Config) -> int:
     if rest and rest[0] == "--":
         rest = rest[1:]
 
+    if cmd == "bind":
+        if not rest:
+            print("用法：eipguard bind 你的chatid", file=sys.stderr)
+            return 2
+        try:
+            chat_id = int(rest[0])
+        except ValueError:
+            print(f"chat id 需要数字，收到：{rest[0]}", file=sys.stderr)
+            return 2
+        ids = set(cfg.admin_chat_ids)
+        ids.add(chat_id)
+        cfg.admin_chat_ids = tuple(sorted(ids))
+        cfg.save()
+        print(f"✅ 已添加管理员 {chat_id}")
+        print(f"   现在共有：{', '.join(str(i) for i in cfg.admin_chat_ids)}")
+        return 0
+
     if cmd == "account":
         if not rest:
             print("用法：eipguard account add 名字 AK SK [地域]")
@@ -314,7 +331,7 @@ async def amain(args: argparse.Namespace) -> int:
             print("  ⚠️ 没有 Cloudflare Token，用 /cf 设置")
         return 0
 
-    if args.command in {"account", "target", "cf"}:
+    if args.command in {"account", "target", "cf", "bind"}:
         return await handle_command(args, cfg)
 
     if args.status or args.switch or args.dns:
