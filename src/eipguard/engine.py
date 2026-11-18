@@ -40,6 +40,7 @@ class SwitchResult:
     old_released: bool = False
     dns: list[dict[str, str]] = field(default_factory=list)
     steps: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     error: str = ""
     elapsed: float = 0.0
 
@@ -198,6 +199,46 @@ class Engine:
         result.old_ip = old.ip
         result.old_allocation_id = old.allocation_id
         result.step(f"当前 IP {old.ip}，EIP {old.allocation_id}")
+
+        # ---------- 域名从哪来：显式配置 > CF 里按旧 IP 自动发现 ----------
+        cf_conf = self.cfg.cloudflare
+        cf_ready = bool(cf_conf.api_token and (cf_conf.zone_name or cf_conf.zone_id))
+        # 没配 CF 时即使写了域名也改不了，直接当作「无域名」，并明确告警
+        dns_names = list(target.dns_records) if cf_ready else []
+        discovered = False
+        if not cf_ready and target.dns_records:
+            result.step("⚠️ 配了域名但没有 Cloudflare 凭证，跳过解析")
+        if not dns_names and old.ip and cf_ready:
+            try:
+                found = await self.cloudflare.find_records_by_ip(old.ip)
+                dns_names = [r.name for r in found]
+                discovered = bool(dns_names)
+                if discovered:
+                    result.step(f"自动发现 {len(dns_names)} 条解析指向旧 IP：{', '.join(dns_names)}")
+            except CloudflareError as exc:
+                result.step(f"⚠️ 自动发现域名失败：{exc}")
+
+        if not dns_names:
+            if not cf_ready:
+                extra = (
+                    f"（已配置的域名 {', '.join(target.dns_records)} 没能更新）"
+                    if target.dns_records
+                    else ""
+                )
+                result.warnings.append(
+                    f"没有配置 Cloudflare（缺 API Token 或域名），这次只换 IP，域名不会更新{extra}。"
+                    "发 /cf 设置后再 /dns 目标名 可以补上。"
+                )
+                result.step("⚠️ 未配置 Cloudflare，只换 IP")
+            else:
+                result.warnings.append(
+                    f"这个 zone 下没有指向 {old.ip} 的 A 记录，这次只换 IP。"
+                    "请发 /target dns 目标名 你的域名 指定要改哪条。"
+                )
+                result.step("⚠️ 未找到指向旧 IP 的域名，只换 IP")
+        else:
+            result.step(f"将更新域名：{', '.join(dns_names)}" + ("（自动发现）" if discovered else ""))
+
         await self._emit(
             {
                 "type": Phase.START,
@@ -206,12 +247,11 @@ class Engine:
                 "old_ip": old.ip,
                 "allocation_id": old.allocation_id,
                 "reason": reason,
-                "dns": target.dns_records,
+                "dns": dns_names,
+                "discovered": discovered,
+                "warnings": result.warnings,
             }
         )
-
-        if not target.dns_records:
-            result.step("⚠️ 这个目标没有配置域名，只换 IP 不改解析")
 
         # ---------- 2) 分配新 EIP ----------
         # 先分配再释放旧 IP，避免万一分配失败导致机器没 IP
@@ -306,9 +346,9 @@ class Engine:
         )
 
         # ---------- 5) 改 Cloudflare 解析 ----------
-        if target.dns_records:
-            result.step(f"更新 Cloudflare 解析（{len(target.dns_records)} 条）")
-            result.dns = await self.cloudflare.point_many(target.dns_records, new.ip)
+        if dns_names:
+            result.step(f"更新 Cloudflare 解析（{len(dns_names)} 条）")
+            result.dns = await self.cloudflare.point_many(dns_names, new.ip)
             ok_count = sum(1 for d in result.dns if d["ok"] == "1")
             result.step(f"解析完成 {ok_count}/{len(result.dns)}")
             await self._emit(
@@ -322,6 +362,10 @@ class Engine:
             )
             if ok_count == 0:
                 raise CloudflareError("point_many", "所有域名解析都更新失败")
+
+        if discovered and dns_names and not target.dns_records:
+            target.dns_records = list(dns_names)
+            result.step("已把发现的域名记入配置")
 
         result.ok = True
         result.step("全部完成")
@@ -337,6 +381,7 @@ class Engine:
                 "dns": result.dns,
                 "reason": reason,
                 "steps": result.steps,
+                "warnings": result.warnings,
                 "elapsed": result.elapsed,
             }
         )

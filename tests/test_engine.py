@@ -102,6 +102,7 @@ class FakeCloudflare:
         self.points: dict[str, str] = {}
         self.fail_names: set[str] = set()
         self.raise_all = False
+        self.by_ip: dict[str, list[str]] = {}
 
     async def point_many(self, names, ip):
         if self.raise_all:
@@ -117,6 +118,14 @@ class FakeCloudflare:
 
     async def list_records(self, name, record_type="A"):
         return []
+
+    async def find_records_by_ip(self, ip, record_type="A"):
+        from eipguard.cloud.cloudflare import DnsRecord
+
+        return [
+            DnsRecord(id=f"rec-{n}", name=n, type="A", content=ip)
+            for n in self.by_ip.get(ip, [])
+        ]
 
     async def close(self):
         return None
@@ -325,4 +334,82 @@ async def test_manual_dns_uses_current_ip(tmp_path):
     results = await engine.manual_dns("hk")
     assert all(r["ok"] == "1" for r in results)
     assert any(e["type"] == "dns_sync" for e in events)
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_no_cloudflare_configured_only_switches_ip(tmp_path):
+    """没配 CF 时：换 IP 照做，但必须明确告警说域名没改。"""
+    cf = FakeCloudflare()
+    cfg, aliyuns, engine, events = make(tmp_path, cf=cf)
+    cfg.cloudflare.api_token = ""
+    cfg.cloudflare.zone_name = ""
+    cfg.cloudflare.zone_id = ""
+
+    result = await engine.switch("hk")
+    assert result.ok is True, "换 IP 本身应该成功"
+    assert result.old_released is True, "旧 IP 仍然要释放，停止计费"
+    assert cf.points == {}, "没配 CF 就不该动解析"
+    assert result.warnings, "必须告诉用户域名没改"
+    assert "没有配置 Cloudflare" in result.warnings[0]
+    assert "域名不会更新" in result.warnings[0]
+    # 推送里也要带警告
+    started = next(e for e in events if e["type"] == "switch_started")
+    assert started["warnings"]
+    assert started["dns"] == []
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_discover_domains_by_old_ip(tmp_path):
+    """没配域名但配了 CF：按旧 IP 反查出哪些域名指向它，自动更新。"""
+    cf = FakeCloudflare()
+    cf.by_ip = {"1.1.1.1": ["hk.example.com", "api.example.com"]}
+    cfg, _, engine, events = make(tmp_path, cf=cf)
+    cfg.target("hk").dns_records = []  # 显式清空，走自动发现
+
+    result = await engine.switch("hk")
+    assert result.ok is True
+    assert set(cf.points) == {"hk.example.com", "api.example.com"}
+    assert all(v == result.new_ip for v in cf.points.values())
+    started = next(e for e in events if e["type"] == "switch_started")
+    assert started["discovered"] is True
+    assert len(started["dns"]) == 2
+    # 发现的域名写回配置，下次不用再查
+    assert set(cfg.target("hk").dns_records) == {"hk.example.com", "api.example.com"}
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_cf_ok_but_nothing_points_to_old_ip(tmp_path):
+    """CF 正常但这个 IP 没被任何记录指向：不能假装成功改了解析。"""
+    cf = FakeCloudflare()
+    cf.by_ip = {}
+    cfg, _, engine, events = make(tmp_path, cf=cf)
+    cfg.target("hk").dns_records = []
+
+    result = await engine.switch("hk")
+    assert result.ok is True
+    assert cf.points == {}
+    assert result.warnings
+    assert "没有指向" in result.warnings[0]
+    assert "/target dns" in result.warnings[0]
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_dns_exception_is_reported_as_failure(tmp_path):
+    """解析过程中抛任何异常，都必须整体判失败，不能报成功。"""
+    class BoomCF(FakeCloudflare):
+        async def point_many(self, names, ip):
+            raise RuntimeError("网络断了")
+
+    cfg, aliyuns, engine, events = make(tmp_path, cf=BoomCF())
+    result = await engine.switch("hk")
+    assert result.ok is False
+    assert "网络断了" in result.error
+    assert any(e["type"] == "switch_failed" for e in events)
+    # 旧 IP 已经释放、新 IP 已经绑定，要在告警里说清楚当前状态
+    assert result.old_released is True
+    assert result.new_ip
     await engine.close()

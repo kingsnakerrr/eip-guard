@@ -265,6 +265,61 @@ class Cloudflare:
             changed.append(updated.name)
         return "updated", f"{', '.join(changed)} → {ip}"
 
+    async def find_records_by_ip(self, ip: str, record_type: str = RECORD_TYPE) -> list[DnsRecord]:
+        """找出这个 zone 里所有指向 ip 的 A 记录。
+
+        用于「没配域名时自动发现」：你只要告诉我 CF Token 和域名，
+        程序就能查出哪些子域名现在指向这台机器。
+        """
+        zone_id = await self.resolve_zone_id()
+        data = await self._request(
+            "GET",
+            f"/zones/{zone_id}/dns_records",
+            params={"content": ip, "type": record_type, "per_page": 100},
+        )
+        out: list[DnsRecord] = []
+        for item in data.get("result") or []:
+            out.append(
+                DnsRecord(
+                    id=str(item.get("id")),
+                    name=str(item.get("name")),
+                    type=str(item.get("type")),
+                    content=str(item.get("content")),
+                    ttl=int(item.get("ttl") or 1),
+                    proxied=bool(item.get("proxied")),
+                )
+            )
+        return out
+
+    async def list_all_records(self, record_type: str = RECORD_TYPE) -> list[DnsRecord]:
+        """列出 zone 下所有 A 记录（用于 /cf check 给人看）。"""
+        zone_id = await self.resolve_zone_id()
+        out: list[DnsRecord] = []
+        page = 1
+        while True:
+            data = await self._request(
+                "GET",
+                f"/zones/{zone_id}/dns_records",
+                params={"type": record_type, "per_page": 100, "page": page},
+            )
+            items = data.get("result") or []
+            for item in items:
+                out.append(
+                    DnsRecord(
+                        id=str(item.get("id")),
+                        name=str(item.get("name")),
+                        type=str(item.get("type")),
+                        content=str(item.get("content")),
+                        ttl=int(item.get("ttl") or 1),
+                        proxied=bool(item.get("proxied")),
+                    )
+                )
+            total_pages = int((data.get("result_info") or {}).get("total_pages") or 1)
+            if page >= total_pages or not items:
+                break
+            page += 1
+        return out
+
     async def point_many(self, names: list[str], ip: str) -> list[dict[str, str]]:
         results: list[dict[str, str]] = []
         for name in names:

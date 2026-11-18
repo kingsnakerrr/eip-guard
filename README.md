@@ -156,6 +156,67 @@ sudo systemctl restart eipguard
 
 ---
 
+## 四.五、域名从哪来？
+
+换 IP 时程序按这个顺序确定要改哪些域名：
+
+```
+1. 你在 /target add 或 config.yaml 里写的 dns_records   ← 优先
+2. 没写？用 CF Token 反查「哪些 A 记录指向旧 IP」        ← 自动发现
+3. 都没有 → 只换 IP，并明确告警告诉你域名没动
+```
+
+### 情况一：什么都没配（没填 CF）
+
+```
+🔁 开始更换 IP
+📤 当前 IP：47.243.1.25
+⚠️ 本次只换 IP，不改域名（原因见下）
+⚠️ 没有配置 Cloudflare（缺 API Token 或域名），这次只换 IP，域名不会更新
+   （已配置的域名 hk.example.com 没能更新）。发 /cf 设置后再 /dns 目标名 可以补上。
+```
+
+**旧 IP 照样释放（停止计费），新 IP 照样绑定**，只是域名还指着旧 IP。配好 CF 后发 `/dns hk-main` 就能补上。
+
+### 情况二：配了 CF，没写域名 → 自动发现
+
+程序会问 Cloudflare：这个 zone 里哪些 A 记录指向旧 IP？
+
+```
+🔁 开始更换 IP
+📤 当前 IP：47.243.1.25
+🌐 待更新域名（自动发现）：hk.example.com, api.example.com, www.example.com
+```
+
+查到的域名会**自动写回配置**，以后不用再查。
+
+### 情况三：CF 里也没记录指向旧 IP
+
+```
+⚠️ 这个 zone 下没有指向 47.243.1.25 的 A 记录，这次只换 IP。
+   请发 /target dns 目标名 你的域名 指定要改哪条。
+```
+
+这时候要明确告诉它域名：`/target dns hk-main hk.example.com`
+
+### 随时查看当前对应关系
+
+```
+/cf check
+```
+
+```
+Cloudflare · example.com
+
+• hk-main 47.243.1.25
+   指向它的域名：hk.example.com, api.example.com
+   ✅ 换 IP 时会自动更新这些域名
+```
+
+这个命令会告诉你：**换 IP 时到底会改哪些域名**，而不是靠猜。
+
+---
+
 ## 五、需要准备什么
 
 | 项目 | 用途 | 在哪拿 |

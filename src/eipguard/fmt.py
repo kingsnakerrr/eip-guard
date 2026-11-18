@@ -52,9 +52,14 @@ def started_text(ev: dict[str, Any]) -> str:
         f"🧭 触发：{esc(ev.get('reason') or '手动')}",
     ]
     if dns:
-        lines.append(f"🌐 待更新域名：{esc(', '.join(dns))}")
+        tag = "（自动发现）" if ev.get("discovered") else ""
+        lines.append(f"🌐 待更新域名{tag}：{esc(', '.join(dns))}")
+    elif ev.get("warnings"):
+        lines.append("⚠️ 本次只换 IP，不改域名（原因见下）")
     else:
-        lines.append("⚠️ 该目标未配置域名，只换 IP")
+        lines.append("ℹ️ 没有域名需要更新")
+    for warning in ev.get("warnings") or []:
+        lines.append(f"⚠️ {esc(warning)}")
     lines.append("")
     lines.append("流程：分配新 IP → 释放旧 IP → 绑定 → 改 CF 解析")
     return "\n".join(lines)
@@ -142,6 +147,10 @@ def success_text(ev: dict[str, Any]) -> str:
         for d in dns:
             mark = "✓" if d.get("ok") == "1" else "✗"
             lines.append(f"   {mark} <code>{esc(d.get('name'))}</code>")
+    elif ev.get("warnings"):
+        lines.append("🌐 域名：本次未更新")
+    for warning in ev.get("warnings") or []:
+        lines.append(f"⚠️ {esc(warning)}")
     elapsed = ev.get("elapsed")
     if elapsed:
         lines.append(f"⏱ 耗时 {elapsed:.1f}s")
@@ -276,6 +285,7 @@ def help_text() -> str:
 /target del 名字
 /target dns 名字 域名1 域名2
 /cf TOKEN 域名 — 设置 Cloudflare
+/cf check [实例] — 看哪些域名指向当前 IP
 /set release on|off — 换完是否释放旧 IP
 /set proxied on|off — CF 小黄云
 /channel -100xxx — 通知频道

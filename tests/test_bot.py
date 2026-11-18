@@ -449,3 +449,38 @@ def test_fmt_help_lists_switch():
     assert "/switch" in text
     assert "/account add" in text
     assert "/target add" in text
+
+
+def test_fmt_started_warns_when_no_dns():
+    text = fmt.started_text(
+        {
+            "target": "hk",
+            "old_ip": "1.1.1.1",
+            "dns": [],
+            "warnings": ["没有配置 Cloudflare，这次只换 IP"],
+        }
+    )
+    assert "只换 IP" in text
+    assert "没有配置 Cloudflare" in text
+
+
+def test_fmt_started_shows_discovered():
+    text = fmt.started_text(
+        {"target": "hk", "old_ip": "1.1.1.1", "dns": ["a.com"], "discovered": True}
+    )
+    assert "自动发现" in text
+
+
+def test_fmt_success_shows_warning():
+    text = fmt.success_text(
+        {
+            "target": "hk",
+            "old_ip": "1.1.1.1",
+            "new_ip": "2.2.2.2",
+            "old_released": True,
+            "dns": [],
+            "warnings": ["没有配置 Cloudflare，这次只换 IP"],
+        }
+    )
+    assert "域名：本次未更新" in text
+    assert "没有配置 Cloudflare" in text

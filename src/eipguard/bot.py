@@ -768,8 +768,24 @@ class BotApp:
         if len(args) >= 2:
             await self._set_cf(args[0], args[1])
             return ConversationHandler.END
+        if args and args[0].lower() in {"check", "ls", "list"}:
+            await self._cf_check(update, args[1] if len(args) > 1 else "")
+            return ConversationHandler.END
         if args:
-            await reply(update, "用法：/cf TOKEN 域名\n例如 /cf abc123... example.com")
+            await reply(update, "用法：/cf TOKEN 域名\n或 /cf check [目标名] 看当前解析")
+            return ConversationHandler.END
+
+        # 已配置过就先显示状态
+        zone = self.cfg.cloudflare.zone_name or self.cfg.cloudflare.zone_id
+        if self.cfg.cloudflare.api_token and zone:
+            await reply(
+                update,
+                f"Cloudflare 已配置：<code>{fmt.esc(zone)}</code>\n\n"
+                "要换一个新 Token/域名就发新的：\n<code>/cf TOKEN 域名</code>\n\n"
+                "查看哪些域名指向当前 IP：<code>/cf check</code>\n"
+                "（直接发 Token 也可以，我一步步问你）",
+                parse_mode=ParseMode.HTML,
+            )
             return ConversationHandler.END
         await reply(
             update,
@@ -796,6 +812,53 @@ class BotApp:
         token = getattr(self, "_pending", {}).get("cf_token", "")
         await self._set_cf(token, zone, chat_id=safe_chat_id(update))
         return ConversationHandler.END
+
+    async def _cf_check(self, update: Update, target_name: str = "") -> None:
+        """列出 CF 里指向各实例当前 IP 的记录，让用户知道能不能自动改。"""
+        cf = self.cfg.cloudflare
+        if not cf.api_token or not (cf.zone_name or cf.zone_id):
+            await reply(
+                update,
+                "还没有配置 Cloudflare。\n发 <code>/cf TOKEN 域名</code> 设置。",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        msg = await reply(update, "⏳ 查询 Cloudflare 记录…")
+        targets = self.cfg.targets
+        if target_name:
+            try:
+                targets = [self.cfg.target(target_name)]
+            except KeyError:
+                await msg.edit_text(f"没有实例 {target_name}")
+                return
+
+        lines = [f"<b>Cloudflare</b> · <code>{fmt.esc(cf.zone_name or cf.zone_id)}</code>", ""]
+        for target in targets:
+            detail = await self.engine.describe(target)
+            eip = detail.get("eip")
+            if not eip:
+                lines.append(f"• <b>{fmt.esc(target.name)}</b>：查不到当前 IP")
+                continue
+            try:
+                found = await self.engine.cloudflare.find_records_by_ip(eip.ip)
+                names = [r.name for r in found]
+            except CloudflareError as exc:
+                lines.append(f"• <b>{fmt.esc(target.name)}</b>：查询失败 {fmt.esc(exc)}")
+                continue
+            lines.append(f"• <b>{fmt.esc(target.name)}</b> <code>{fmt.esc(eip.ip)}</code>")
+            if names:
+                lines.append(f"   指向它的域名：{fmt.esc(', '.join(names))}")
+                # 配置里没写但能发现 -> 提示可以自动
+                if not target.dns_records:
+                    lines.append("   ✅ 换 IP 时会自动更新这些域名")
+                elif set(names) != set(target.dns_records):
+                    lines.append(f"   ℹ️ 配置里写的是：{fmt.esc(', '.join(target.dns_records))}")
+            else:
+                lines.append("   ⚠️ 没有 A 记录指向这个 IP，换 IP 时不会自动改")
+                lines.append("   → 用 /target dns 目标名 你的域名 指定")
+        lines.append("")
+        lines.append("换 IP 时：配置里写了域名就改配置的；没写就自动按旧 IP 查。")
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     async def _set_cf(self, token: str, zone: str, chat_id: int | None = None) -> None:
         cf = Cloudflare(token, zone_name=zone, ttl=self.cfg.cloudflare.ttl,
