@@ -85,19 +85,32 @@ eipguard --check-config
    eipguard account add main 真实AK 真实SK cn-hongkong
    ```
 
-### 想彻底重装
+### 想彻底重装（推荐一键）
 
 ```bash
-# 卸载（保留数据）
-bash <(curl -Ls .../install.sh) --uninstall
-# 或连配置一起删
-rm -rf /opt/eipguard
-
-# 重新装
-bash <(curl -Ls .../install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/reinstall.sh) --fresh
 ```
 
-只有当你第一版的配置本来就是错的、或者想换安装目录时才需要这样。否则 `--update` 更省事。
+它会依次：
+
+1. 把原 `.env` / `config.yaml` 里的密钥**备份到 `/root/eipguard-backup-*.txt`**
+2. 停止并删除 systemd 服务、`eipguard` 命令、`eipguard` 用户、`/opt/eipguard`
+3. 顺带清理第一版遗留的 `eip-probe` 服务
+4. 直接进入全新安装
+
+只想清理不安装：
+
+```bash
+bash <(curl -Ls .../reinstall.sh) --clean
+```
+
+**什么时候该重装而不是升级**：
+
+| 情况 | 做法 |
+|---|---|
+| 配置本来就填错过、搞不清现在什么状态 | 重装（最省心） |
+| 正常在用，只想更新代码 | `--update`（保留配置） |
+| 想换安装目录 | 重装 |
 
 ---
 

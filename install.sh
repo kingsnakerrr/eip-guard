@@ -297,8 +297,8 @@ install_main() {
 
   local src; src="$(fetch_source)" || die "获取源码失败"
 
-  local update=0
-  [ -f "$APP_DIR/config.yaml" ] && update=1
+  local fresh=1
+  [ -f "$APP_DIR/src/eipguard/__init__.py" ] && fresh=0
 
   info "部署到 $APP_DIR"
   mkdir -p "$APP_DIR/data"
@@ -381,7 +381,11 @@ UNIT
   fi
 
   echo
-  ok "安装完成${update:+（这是更新，配置已保留）}"
+  if [ "$fresh" = "1" ]; then
+    ok "安装完成"
+  else
+    ok "更新完成（配置已保留）"
+  fi
   echo
   msg "  ${BLD}下一步（任选其一）${RST}"
   msg ""
