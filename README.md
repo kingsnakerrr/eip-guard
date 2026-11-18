@@ -35,6 +35,72 @@ bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/in
 
 ---
 
+## 一.五、从第一版升级
+
+**不用删，直接升级**，配置会自动迁移（先备份 `config.yaml.bak`）：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh) --update
+```
+
+升级过程：
+
+```
+→ 更新代码
+→ 迁移旧配置（备份为 config.yaml.bak）
+    · aliyun.access_key_id → aliyun.accounts[default]
+    · targets[hk-main].probe_port/aux_ports 已忽略
+    · cloudflare.zone_name 取自 .env 的 CF_ZONE_NAME（realdomain.com）
+✅ 配置校验通过
+  管理员：555666
+  阿里云账号：1 个
+    - default · akRE… · cn-hongkong · 1 台实例
+  实例（1 台）：
+    - hk-main · default · i-j6cxxx · hk.example.com
+✓ eipguard 已启动
+```
+
+**会保留的**：阿里云 AK/SK、Cloudflare Token 和域名、实例 ID、域名列表、管理员、频道。
+**会丢的**：探针配置（新版不需要了，直接忽略）。
+
+升级后自己确认一眼：
+
+```bash
+eipguard --check-config
+```
+
+### 第一版的两个坑，升级时要注意
+
+1. **`zone_name` 写死成 `example.com`**
+   第一版的 `config.example.yaml` 把域名硬编码了，你的真实域名其实在 `.env` 的 `CF_ZONE_NAME`。
+   升级时会自动纠正，但如果你的 `.env` 里也没填，需要手动补：
+   ```bash
+   eipguard cf 你的CF_TOKEN 你的真实域名.com
+   ```
+
+2. **`.env` 可能还是模板占位符**
+   如果你当初是用 `--non-interactive` 装的而且没手动改 `.env`，里面还是 `your_bot_token` 这种。
+   升级后先 `eipguard --check-config`，看到账号/AK 是占位符就重新填：
+   ```bash
+   eipguard account add main 真实AK 真实SK cn-hongkong
+   ```
+
+### 想彻底重装
+
+```bash
+# 卸载（保留数据）
+bash <(curl -Ls .../install.sh) --uninstall
+# 或连配置一起删
+rm -rf /opt/eipguard
+
+# 重新装
+bash <(curl -Ls .../install.sh)
+```
+
+只有当你第一版的配置本来就是错的、或者想换安装目录时才需要这样。否则 `--update` 更省事。
+
+---
+
 ## 二、配置（两种方式，随时切换）
 
 ### 方式 A：在 Telegram 里配置（推荐）

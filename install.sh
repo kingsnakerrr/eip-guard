@@ -326,6 +326,12 @@ install_main() {
   chmod 600 "$APP_DIR/.env" "$APP_DIR/config.yaml"
   chmod 700 "$APP_DIR/data"
 
+  # 老版本配置自动迁移（先备份）
+  if [ -f "$APP_DIR/config.yaml" ] && ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --check-config 2>&1 | grep -q "第一版配置" ); then
+    info "检测到第一版配置，正在迁移（会先备份）"
+    ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --migrate ) || warn "迁移失败，原配置已备份为 config.yaml.bak"
+  fi
+
   info "校验配置"
   if ! ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --check-config ); then
     warn "配置校验未通过，修好后手动启动"
@@ -417,17 +423,42 @@ show_log() {
 }
 
 do_update() {
+  [ -f "$APP_DIR/src/eipguard/__init__.py" ] || { warn "还没安装，走完整安装"; install_main; return; }
+  need_root
+  title "升级（代码更新 + 配置迁移，密钥保留）"
+
   local src; src="$(fetch_source)" || die "获取源码失败"
-  if [ -f "$APP_DIR/src/eipguard/__init__.py" ]; then
-    rm -rf "$APP_DIR/src"; cp -r "$src/src" "$APP_DIR/"
-    "$APP_DIR/.venv/bin/pip" install -q --no-deps -e "$APP_DIR" >/dev/null
-    chown -R eipguard:eipguard "$APP_DIR" 2>/dev/null || true
-    if has_systemd; then svc_start "$SERVICE"; fi
-    ok "代码已更新（配置未动）"
-  else
-    warn "未安装，走完整安装"
-    install_main
+  info "更新代码"
+  rm -rf "$APP_DIR/src"
+  cp -r "$src/src" "$APP_DIR/"
+  "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt" >/dev/null 2>&1 || true
+  "$APP_DIR/.venv/bin/pip" install -q --no-deps -e "$APP_DIR" >/dev/null || die "安装失败"
+  chown -R eipguard:eipguard "$APP_DIR" 2>/dev/null || true
+
+  # 旧配置自动迁移
+  if ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --check-config 2>&1 | grep -q "第一版配置" ); then
+    info "迁移旧配置（备份为 config.yaml.bak）"
+    ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --migrate ) || warn "迁移失败，看 config.yaml.bak"
   fi
+
+  info "校验"
+  ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --check-config ) || {
+    warn "配置有问题，服务未重启。修好后 systemctl restart $SERVICE"
+    return 1
+  }
+
+  # 命令行包装也刷新一下
+  cat >/usr/local/bin/eipguard <<SH
+#!/bin/sh
+exec $APP_DIR/.venv/bin/python -m eipguard -c $APP_DIR/config.yaml "\$@"
+SH
+  chmod +x /usr/local/bin/eipguard
+
+  if has_systemd; then svc_start "$SERVICE"; fi
+  ok "升级完成"
+  echo
+  msg "  ${BLD}原来配的账号、实例、域名都还在${RST}（备份在 ${APP_DIR}/config.yaml.bak）"
+  msg "  去看一眼：${BLD}eipguard --check-config${RST}"
 }
 
 do_uninstall() {
@@ -538,7 +569,7 @@ ${BLD}EIP Guard${RST} · 阿里云 EIP 手动换 IP + Cloudflare 解析 + Telegr
   install.sh --install     安装 / 更新
   install.sh --status      查看状态
   install.sh --log         查看日志
-  install.sh --update      只更新代码
+  install.sh --update      升级（更新代码 + 自动迁移旧配置，保留密钥）
   install.sh --uninstall   卸载
 
 选项：
@@ -567,7 +598,7 @@ while [ $# -gt 0 ]; do
     --install|--main) ACTION="install" ;;
     --status) ACTION="status" ;;
     --log) ACTION="log" ;;
-    --update) ACTION="update" ;;
+    --update|--upgrade) ACTION="update" ;;
     --uninstall) ACTION="uninstall" ;;
     --dir) APP_DIR="${2:-}"; shift ;;
     --pip-index) PIP_INDEX="${2:-}"; shift ;;

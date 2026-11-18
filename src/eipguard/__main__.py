@@ -50,6 +50,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--dns", metavar="TARGET", help="命令行重同步解析")
     ap.add_argument("--no-bot", action="store_true", help="不启动机器人")
     ap.add_argument("--bind", metavar="CHAT_ID", help="把 chat id 加为管理员")
+    ap.add_argument(
+        "--migrate",
+        action="store_true",
+        help="把第一版配置改写成新格式（会先备份）",
+    )
     # 子命令：account / target / cf（命令行管理，替代 TG 交互）
     ap.add_argument("command", nargs="?", help="account | target | cf")
     ap.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
@@ -309,6 +314,13 @@ async def amain(args: argparse.Namespace) -> int:
         print(f"   现在共有：{', '.join(str(i) for i in cfg.admin_chat_ids)}")
         return 0
 
+    if cfg.legacy_migrated:
+        print("ℹ️ 检测到第一版配置，已自动兼容：")
+        for item in cfg.legacy_migrated:
+            print(f"    · {item}")
+        print(f"    建议保存为新格式：eipguard -c {cfg.path} --migrate")
+        print()
+
     if args.check_config:
         print("✅ 配置校验通过")
         print(f"  配置：{cfg.path}")
@@ -329,6 +341,23 @@ async def amain(args: argparse.Namespace) -> int:
             print("  ⚠️ 还没有实例，用 /target add 或在 config.yaml 里添加")
         if not cfg.cloudflare.api_token:
             print("  ⚠️ 没有 Cloudflare Token，用 /cf 设置")
+        return 0
+
+    if args.migrate:
+        if not cfg.legacy_migrated:
+            print("配置已经是新格式，无需迁移")
+            return 0
+        backup = cfg.path.with_suffix(".yaml.bak")
+        if not backup.exists():
+            backup.write_text(cfg.path.read_text("utf-8"), "utf-8")
+            print(f"📄 已备份原配置：{backup}")
+        cfg.save()
+        print(f"✅ 已迁移为新格式：{cfg.path}")
+        for item in cfg.legacy_migrated:
+            print(f"    · {item}")
+        print()
+        print("验证：eipguard --check-config")
+        print("然后：systemctl restart eipguard")
         return 0
 
     if args.command in {"account", "target", "cf", "bind"}:

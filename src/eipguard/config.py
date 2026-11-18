@@ -233,9 +233,9 @@ class CloudflareConfig:
 @dataclass
 class SwitchConfig:
     max_attempts: int = 3
+    # 换完是否释放旧 IP（停止计费）。流程固定为：先分配新 IP 再释放旧 IP，
+    # 这样分配失败时机器还有网络。
     release_old: bool = True
-    # 先释放旧 EIP 再绑定新 EIP（省几秒计费，但绑定失败会有短暂空窗）
-    release_before_bind: bool = True
     internet_charge_type: str = ""
     bandwidth_mbps: int | None = None
     isp: str = ""
@@ -246,7 +246,6 @@ class SwitchConfig:
         return cls(
             max_attempts=max(1, _as_int(raw.get("max_attempts"), 3)),
             release_old=_as_bool(raw.get("release_old"), True),
-            release_before_bind=_as_bool(raw.get("release_before_bind"), True),
             internet_charge_type=str(raw.get("internet_charge_type") or "").strip(),
             bandwidth_mbps=_as_int(bw, 0) or None,
             isp=str(raw.get("isp") or "").strip(),
@@ -256,7 +255,6 @@ class SwitchConfig:
         return {
             "max_attempts": self.max_attempts,
             "release_old": self.release_old,
-            "release_before_bind": self.release_before_bind,
             "internet_charge_type": self.internet_charge_type,
             "bandwidth_mbps": self.bandwidth_mbps,
             "isp": self.isp,
@@ -279,6 +277,8 @@ class Config:
     timezone: str = "Asia/Shanghai"
     log_level: str = "INFO"
     raw: dict[str, Any] = field(default_factory=dict)
+    # 从旧版本配置自动迁移时记下的说明（启动时会打印并提示保存）
+    legacy_migrated: list[str] = field(default_factory=list)
 
     # ------------------------------------------------------------------ 查询
     def target(self, name: str) -> Target:
@@ -322,7 +322,26 @@ class Config:
         channel = tg.get("channel_id")
         channel_id = int(str(channel).strip()) if channel not in (None, "") else None
 
-        accounts_raw = (raw.get("aliyun") or {}).get("accounts") or []
+        aliyun_raw = raw.get("aliyun") or {}
+        accounts_raw = aliyun_raw.get("accounts") or []
+
+        # ---------- 兼容第一版：aliyun 直接平铺 access_key_id ----------
+        legacy_migrated: list[str] = []
+        if not accounts_raw and aliyun_raw.get("access_key_id"):
+            legacy = {
+                "name": "default",
+                "access_key_id": aliyun_raw.get("access_key_id"),
+                "access_key_secret": aliyun_raw.get("access_key_secret"),
+                "region": aliyun_raw.get("region")
+                or aliyun_raw.get("region_id")
+                or aliyun_raw.get("default_region")
+                or "cn-hongkong",
+                "endpoint": aliyun_raw.get("endpoint"),
+                "api_version": aliyun_raw.get("api_version"),
+            }
+            accounts_raw = [legacy]
+            legacy_migrated.append("aliyun.access_key_id → aliyun.accounts[default]")
+
         accounts: dict[str, Account] = {}
         for item in accounts_raw:
             if not isinstance(item, dict):
@@ -332,7 +351,15 @@ class Config:
                 raise ConfigError(f"阿里云账号重名：{account.name}")
             accounts[account.name] = account
 
-        targets = [Target.from_dict(t) for t in (raw.get("targets") or [])]
+        targets: list[Target] = []
+        for item in raw.get("targets") or []:
+            if not isinstance(item, dict):
+                raise ConfigError("targets[] 必须是对象")
+            if not item.get("account"):
+                item = {**item, "account": "default"}
+            if any(k in item for k in ("probe_port", "aux_ports")):
+                legacy_migrated.append(f"targets[{item.get('name')}].probe_port/aux_ports 已忽略")
+            targets.append(Target.from_dict(item))
         names = [t.name for t in targets]
         if len(set(names)) != len(names):
             raise ConfigError("targets[].name 不能重复")
@@ -347,6 +374,15 @@ class Config:
         if not data_dir.is_absolute():
             data_dir = (cfg_path.parent / data_dir).resolve()
 
+        # 第一版的 config.example.yaml 把 zone_name 写死成 example.com，
+        # 真实域名只在 .env 的 CF_ZONE_NAME 里。迁移时纠正过来。
+        cf_raw = raw.get("cloudflare") or {}
+        zone_name = str(cf_raw.get("zone_name") or "").strip()
+        env_zone = str(env.get("CF_ZONE_NAME") or "").strip()
+        if legacy_migrated and env_zone and zone_name in {"", "example.com"}:
+            cf_raw = {**cf_raw, "zone_name": env_zone}
+            legacy_migrated.append(f"cloudflare.zone_name 取自 .env 的 CF_ZONE_NAME（{env_zone}）")
+
         return cls(
             path=cfg_path,
             telegram_token=token,
@@ -356,12 +392,13 @@ class Config:
             tg_proxy=str(tg.get("proxy") or "").strip(),
             accounts=accounts,
             targets=targets,
-            cloudflare=CloudflareConfig.from_dict(raw.get("cloudflare") or {}),
+            cloudflare=CloudflareConfig.from_dict(cf_raw),
             switch=SwitchConfig.from_dict(raw.get("switch") or {}),
             data_dir=data_dir,
             timezone=str(raw.get("timezone") or "Asia/Shanghai"),
             log_level=str(raw.get("log_level") or "INFO"),
             raw=raw_original,
+            legacy_migrated=legacy_migrated,
         )
 
     # ------------------------------------------------------------------ 回写

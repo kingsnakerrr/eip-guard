@@ -162,3 +162,92 @@ def test_save_writes_accounts_and_targets_verbatim(tmp_path):
     assert data["targets"][0]["instance_id"] == "i-abc"
     # 占位符已被展开成真实值（TG 新增的账号必须能落盘）
     assert "${" not in cfg.path.read_text("utf-8")
+
+
+LEGACY_V1 = """
+telegram:
+  token: "${TG_BOT_TOKEN}"
+  admin_chat_ids: "${TG_ADMIN_IDS:-}"
+  channel_id: "${TG_CHANNEL_ID:-}"
+aliyun:
+  access_key_id: "${ALIYUN_AK_ID}"
+  access_key_secret: "${ALIYUN_AK_SECRET}"
+  region_id: "cn-hongkong"
+cloudflare:
+  api_token: "${CF_API_TOKEN}"
+  zone_name: "example.com"
+detect:
+  provider: probe_agent
+  probe_agent:
+    urls: "${PROBE_AGENT_URL}"
+    token: "${PROBE_AGENT_TOKEN}"
+targets:
+  - name: hk-main
+    instance_id: "i-abc"
+    probe_port: 443
+    aux_ports: [22, 80]
+    dns_records: ["hk.example.com"]
+"""
+
+LEGACY_ENV = """
+TG_BOT_TOKEN=111:REAL
+TG_ADMIN_IDS=555666
+TG_CHANNEL_ID=-1001234567890
+ALIYUN_AK_ID=akREAL
+ALIYUN_AK_SECRET=skREAL
+CF_API_TOKEN=cfREAL
+CF_ZONE_NAME=realdomain.com
+PROBE_AGENT_URL=http://1.1.1.1:8787
+PROBE_AGENT_TOKEN=ptok
+"""
+
+
+def test_legacy_v1_config_migrates_accounts(tmp_path):
+    """第一版平铺的 aliyun.access_key_id 要变成 accounts[default]。"""
+    cfg = Config.load(write(tmp_path, LEGACY_V1, LEGACY_ENV))
+    assert list(cfg.accounts) == ["default"]
+    assert cfg.account("default").access_key_id == "akREAL"
+    assert cfg.account("default").access_key_secret == "skREAL"
+    assert cfg.account("default").region == "cn-hongkong"
+
+
+def test_legacy_target_gets_default_account(tmp_path):
+    cfg = Config.load(write(tmp_path, LEGACY_V1, LEGACY_ENV))
+    assert cfg.target("hk-main").account == "default"
+    assert cfg.target("hk-main").dns_records == ["hk.example.com"]
+
+
+def test_legacy_ignores_probe_fields(tmp_path):
+    cfg = Config.load(write(tmp_path, LEGACY_V1, LEGACY_ENV))
+    assert any("probe_port" in item for item in cfg.legacy_migrated)
+
+
+def test_legacy_zone_name_from_env(tmp_path):
+    """第一版把 zone_name 写死 example.com，真域名在 .env 里，要纠正。"""
+    cfg = Config.load(write(tmp_path, LEGACY_V1, LEGACY_ENV))
+    assert cfg.cloudflare.zone_name == "realdomain.com"
+
+
+def test_legacy_keeps_admin_channel(tmp_path):
+    cfg = Config.load(write(tmp_path, LEGACY_V1, LEGACY_ENV))
+    assert cfg.admin_chat_ids == (555666,)
+    assert cfg.channel_id == -1001234567890
+
+
+def test_legacy_migrate_saves_new_format(tmp_path):
+    cfg = Config.load(write(tmp_path, LEGACY_V1, LEGACY_ENV))
+    cfg.save()
+    again = Config.load(cfg.path)
+    assert again.account("default").access_key_id == "akREAL"
+    assert again.cloudflare.zone_name == "realdomain.com"
+    assert again.target("hk-main").account == "default"
+    # 迁移后不再需要 .env
+    assert again.legacy_migrated == [] or "第一版" not in str(again.legacy_migrated)
+    text = cfg.path.read_text("utf-8")
+    assert "accounts:" in text
+    assert "access_key_id: akREAL" in text
+
+
+def test_new_format_not_treated_as_legacy(tmp_path):
+    cfg = Config.load(write(tmp_path, BASE, ENV))
+    assert cfg.legacy_migrated == []
