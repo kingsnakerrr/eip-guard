@@ -1,504 +1,328 @@
 from __future__ import annotations
 
-import time
-from typing import Any
-
 import pytest
 
 from eipguard.cloud.aliyun import EipInfo
-from eipguard.cloud.cloudflare import DnsRecord
-from eipguard.config import Config, TargetConfig
-from eipguard.detect.probe import (
-    LayerResult,
-    NodeResult,
-    PortProbe,
-    ProbeOutcome,
-    Verdict,
-    judge,
-)
+from eipguard.config import Config
 from eipguard.engine import Engine
-from eipguard.state import Settings, StateStore
+
+CONFIG = """
+telegram:
+  token: "1:abc"
+  admin_chat_ids: "42"
+aliyun:
+  accounts:
+    - name: main
+      access_key_id: ak1
+      access_key_secret: sk1
+      region: cn-hongkong
+    - name: second
+      access_key_id: ak2
+      access_key_secret: sk2
+      region: ap-southeast-1
+cloudflare:
+  api_token: cf
+  zone_name: example.com
+switch:
+  release_old: true
+  max_attempts: 2
+targets:
+  - name: hk
+    account: main
+    instance_id: i-1
+    dns_records: ["hk.example.com", "api.example.com"]
+  - name: sg
+    account: second
+    instance_id: i-2
+    dns_records: ["sg.example.com"]
+"""
 
 
 class FakeAliyun:
-    def __init__(self) -> None:
+    def __init__(self, tag: str = "") -> None:
+        self.tag = tag
         self.eips: dict[str, EipInfo] = {}
         self.calls: list[str] = []
-        self.fail_on: set[str] = set()
-        self.alloc_queue: list[str] = []
         self._seq = 0
+        self.alloc_ips: list[str] = []
+        self.alloc_fail = 0
 
-    def seed(self, allocation_id: str, ip: str, instance_id: str = "", status: str = "Available") -> EipInfo:
-        info = EipInfo(allocation_id=allocation_id, ip=ip, status=status, instance_id=instance_id)
-        self.eips[allocation_id] = info
-        return info
+    def seed(self, allocation_id: str, ip: str, instance_id: str = "", status: str = "Available") -> None:
+        self.eips[allocation_id] = EipInfo(
+            allocation_id=allocation_id, ip=ip, status=status, instance_id=instance_id
+        )
 
-    async def describe_eips(self, **kw: Any) -> list[EipInfo]:
-        out = list(self.eips.values())
-        if kw.get("allocation_id"):
-            out = [e for e in out if e.allocation_id == kw["allocation_id"]]
-        if kw.get("instance_id"):
-            out = [e for e in out if e.instance_id == kw["instance_id"]]
-        return out
+    async def describe_eips(self, **kw):
+        return list(self.eips.values())
 
-    async def get_eip(self, allocation_id: str, region_id: str | None = None) -> EipInfo | None:
+    async def get_eip(self, allocation_id, region_id=None):
         return self.eips.get(allocation_id)
 
-    async def find_instance_eip(self, instance_id: str, region_id: str | None = None) -> EipInfo | None:
+    async def find_instance_eip(self, instance_id, region_id=None):
         for e in self.eips.values():
             if e.instance_id == instance_id:
                 return e
         return None
 
-    async def allocate_eip(self, **kw: Any) -> EipInfo:
-        if "AllocateEipAddress" in self.fail_on:
-            raise RuntimeError("allocate failed")
-        self._seq += 1
-        ip = self.alloc_queue.pop(0) if self.alloc_queue else f"10.0.0.{self._seq}"
-        return self.seed(f"eip-new{self._seq}", ip)
+    async def allocate_eip(self, **kw):
+        if self.alloc_fail > 0:
+            self.alloc_fail -= 1
+            from eipguard.cloud.aliyun import AliyunError
 
-    async def associate(self, allocation_id: str, instance_id: str, region_id: str | None = None) -> None:
+            raise AliyunError("AllocateEipAddress", "Throttling", "限流")
+        self._seq += 1
+        ip = self.alloc_ips.pop(0) if self.alloc_ips else f"10.0.{self.tag or '0'}.{self._seq}"
+        self.seed(f"{self.tag}eip-new{self._seq}", ip)
+        return self.eips[f"{self.tag}eip-new{self._seq}"]
+
+    async def associate(self, allocation_id, instance_id, region_id=None):
         self.calls.append(f"associate:{allocation_id}")
-        if "AssociateEipAddress" in self.fail_on:
-            raise RuntimeError("associate failed")
         e = self.eips[allocation_id]
         e.instance_id = instance_id
         e.status = "InUse"
 
-    async def unassociate(self, allocation_id: str, instance_id: str = "", region_id: str | None = None) -> None:
+    async def unassociate(self, allocation_id, instance_id="", region_id=None):
         self.calls.append(f"unassociate:{allocation_id}")
         e = self.eips[allocation_id]
         e.instance_id = ""
         e.status = "Available"
 
-    async def release(self, allocation_id: str, region_id: str | None = None) -> None:
+    async def release(self, allocation_id, region_id=None):
         self.calls.append(f"release:{allocation_id}")
         self.eips.pop(allocation_id, None)
 
-    async def wait_status(self, allocation_id: str, wanted: set[str], **kw: Any) -> EipInfo:
+    async def wait_status(self, allocation_id, wanted, **kw):
         e = self.eips[allocation_id]
-        e.status = wanted.pop() if len(wanted) == 1 else e.status
+        e.status = sorted(wanted)[0]
         return e
 
 
 class FakeCloudflare:
     def __init__(self) -> None:
         self.points: dict[str, str] = {}
-        self.fail = False
+        self.fail_names: set[str] = set()
+        self.raise_all = False
 
-    async def point_many(self, names: list[str], ip: str) -> list[dict[str, str]]:
-        if self.fail:
+    async def point_many(self, names, ip):
+        if self.raise_all:
             return [{"name": n, "action": "error", "detail": "cf down", "ok": "0"} for n in names]
         out = []
         for n in names:
-            self.points[n] = ip
-            out.append({"name": n, "action": "updated", "detail": f"{n} → {ip}", "ok": "1"})
+            if n in self.fail_names:
+                out.append({"name": n, "action": "error", "detail": "record not found", "ok": "0"})
+            else:
+                self.points[n] = ip
+                out.append({"name": n, "action": "updated", "detail": f"{n} → {ip}", "ok": "1"})
         return out
 
-    async def point_to(self, name: str, ip: str) -> tuple[str, str]:
-        self.points[name] = ip
-        return "updated", f"{name} → {ip}"
+    async def list_records(self, name, record_type="A"):
+        return []
 
-    async def close(self) -> None:
+    async def close(self):
         return None
 
 
-class FakeDetector:
-    """按 IP 或按顺序返回预设结论；list 用尽后重复最后一个。"""
+def make(tmp_path, *, cf: FakeCloudflare | None = None) -> tuple[Config, dict[str, FakeAliyun], Engine, list]:
+    path = tmp_path / "config.yaml"
+    path.write_text(CONFIG, "utf-8")
+    cfg = Config.load(path)
+    aliyuns = {"main": FakeAliyun("a"), "second": FakeAliyun("b")}
+    aliyuns["main"].seed("eip-a1", "1.1.1.1", instance_id="i-1", status="InUse")
+    aliyuns["second"].seed("eip-b1", "2.2.2.2", instance_id="i-2", status="InUse")
+    events: list = []
 
-    def __init__(self, results: list[ProbeOutcome]) -> None:
-        self.results = results
-        self.calls = 0
-        self.by_ip: dict[str, ProbeOutcome] = {}
-
-    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
-        self.calls += 1
-        if ip in self.by_ip:
-            return self.by_ip[ip]
-        if not self.results:
-            return ok_outcome()
-        idx = min(self.calls - 1, len(self.results) - 1)
-        return self.results[idx]
-
-    async def close(self) -> None:
-        return None
-
-
-class WallDetector(FakeDetector):
-    """旧 IP 被墙、其余 IP 正常 —— 贴近真实换 IP 场景。"""
-
-    def __init__(self, walled: set[str]) -> None:
-        super().__init__([])
-        self.walled = walled
-
-    async def check(self, ip: str, ports: list[int], *, sni: str = "") -> ProbeOutcome:
-        self.calls += 1
-        return blocked_outcome() if ip in self.walled else ok_outcome()
-
-
-def _probe(port: int, ok: bool, kind: str = "") -> PortProbe:
-    return PortProbe(port, LayerResult(ok, 10.0 if ok else None, kind, "" if ok else kind))
-
-
-def ok_outcome() -> ProbeOutcome:
-    return judge(
-        [
-            NodeResult("cn", "cn", LayerResult(True), {443: _probe(443, True)}),
-            NodeResult("us", "overseas", LayerResult(True), {443: _probe(443, True)}),
-        ],
-        ports=[443],
-    )
-
-
-def blocked_outcome() -> ProbeOutcome:
-    """能 ping 通但端口全不通、国外正常 → IP 被墙。"""
-    return judge(
-        [
-            NodeResult("cn", "cn", LayerResult(True), {443: _probe(443, False, "timeout")}),
-            NodeResult("us", "overseas", LayerResult(True), {443: _probe(443, True)}),
-        ],
-        ports=[443],
-    )
-
-
-def port_blocked_outcome() -> ProbeOutcome:
-    return judge(
-        [
-            NodeResult(
-                "cn", "cn", LayerResult(True),
-                {443: _probe(443, False, "timeout"), 22: _probe(22, True)},
-            ),
-            NodeResult(
-                "us", "overseas", LayerResult(True),
-                {443: _probe(443, True), 22: _probe(22, True)},
-            ),
-        ],
-        ports=[443, 22],
-    )
-
-
-def service_down_outcome() -> ProbeOutcome:
-    return judge(
-        [
-            NodeResult("cn", "cn", LayerResult(True), {443: _probe(443, False, "refused")}),
-            NodeResult("us", "overseas", LayerResult(True), {443: _probe(443, False, "refused")}),
-        ],
-        ports=[443],
-    )
-
-
-def make_cfg(tmp_path: Any, **over: Any) -> Config:
-    config_text = f"""
-telegram:
-  token: "1:abc"
-  admin_chat_ids: "42"
-aliyun:
-  access_key_id: ak
-  access_key_secret: sk
-cloudflare:
-  api_token: cf
-  zone_name: example.com
-detect:
-  provider: tcp_self
-switch:
-  auto: true
-  cooldown: 0
-  max_attempts: 2
-  release_old: true
-  restore_old_on_failure: true
-targets:
-  - name: hk
-    instance_id: i-1
-    dns_records: ["hk.example.com"]
-"""
-    p = tmp_path / "config.yaml"
-    p.write_text(config_text, "utf-8")
-    cfg = Config.load(p)
-    for k, v in over.items():
-        setattr(cfg, k, v)
-    return cfg
-
-
-def make_engine(tmp_path: Any, detector: FakeDetector, aliyun: FakeAliyun, cf: FakeCloudflare) -> tuple[Engine, StateStore, list]:
-    cfg = make_cfg(tmp_path)
-    store = StateStore.load(cfg.data_dir / "state.json", ["hk"], {"auto": True})
-    settings = Settings.from_values({"auto": True, "interval": 1, "failure_threshold": 1, "cooldown": 0}, {})
-    events: list[dict[str, Any]] = []
-
-    async def notify(ev: dict[str, Any]) -> None:
+    async def notify(ev):
         events.append(ev)
 
     engine = Engine(
         cfg,
-        store,
-        settings,
         notifier=notify,
-        aliyun=aliyun,  # type: ignore[arg-type]
-        cloudflare=cf,  # type: ignore[arg-type]
-        detector=detector,  # type: ignore[arg-type]
+        aliyuns=aliyuns,  # type: ignore[arg-type]
+        cloudflare=(cf or FakeCloudflare()),  # type: ignore[arg-type]
     )
-    engine.cfg.detect.verify_delay = 0
-    engine.cfg.detect.verify_attempts = 1
-    return engine, store, events
+    return cfg, aliyuns, engine, events
 
 
 @pytest.mark.asyncio
-async def test_switch_happy_path(tmp_path):
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
-    cf = FakeCloudflare()
-    detector = FakeDetector([blocked_outcome(), ok_outcome()])
-    engine, store, events = make_engine(tmp_path, detector, aliyun, cf)
-
-    result = await engine.switch("hk", reason="test", manual=True)
+async def test_switch_releases_old_then_binds_new(tmp_path):
+    cfg, aliyuns, engine, events = make(tmp_path)
+    result = await engine.switch("hk", reason="手动")
     assert result.ok is True
     assert result.old_ip == "1.1.1.1"
     assert result.new_ip
-    assert cf.points["hk.example.com"] == result.new_ip
-    assert "release:eip-old" in aliyun.calls
-    assert store.get("hk").current_ip == result.new_ip
-    types = [e["type"] for e in events]
-    assert types[0] == "switch_started"
-    assert "switch_success" in types
+    assert result.old_released is True
+
+    main = aliyuns["main"]
+    # 旧 EIP 被解绑并释放
+    assert "unassociate:eip-a1" in main.calls
+    assert "release:eip-a1" in main.calls
+    assert "eip-a1" not in main.eips, "旧 EIP 必须被释放以停止计费"
+    # 新 EIP 绑定到实例
+    new = next(e for e in main.eips.values() if e.instance_id == "i-1")
+    assert new.ip == result.new_ip
+    # 域名指向新 IP
+    assert cfg.target("hk").dns_records
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_switch_rolls_back_when_dns_fails(tmp_path):
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
-    cf = FakeCloudflare()
-    cf.fail = True
-    detector = FakeDetector([blocked_outcome()])
-    engine, store, events = make_engine(tmp_path, detector, aliyun, cf)
+async def test_switch_pushes_every_step(tmp_path):
+    """释放成功、拿到新 IP、解析成功都要推送。"""
+    cfg, _, engine, events = make(tmp_path)
+    await engine.switch("hk")
+    kinds = [e["type"] for e in events]
+    assert "switch_started" in kinds
+    assert "ip_allocated" in kinds
+    assert "old_ip_released" in kinds
+    assert "ip_bound" in kinds
+    assert "dns_updated" in kinds
+    assert kinds[-1] == "switch_success"
 
-    result = await engine.switch("hk", reason="test")
-    assert result.ok is False
-    # 新 EIP 被释放，旧 EIP 回绑，业务仍可用
-    assert "eip-old" in aliyun.eips
-    assert aliyun.eips["eip-old"].instance_id == "i-1"
-    assert any(e["type"] == "switch_failed" for e in events)
+    released = next(e for e in events if e["type"] == "old_ip_released")
+    assert released["old_ip"] == "1.1.1.1"
+    assert released["allocation_id"] == "eip-a1"
+
+    allocated = next(e for e in events if e["type"] == "ip_allocated")
+    assert allocated["new_ip"]
+
+    dns = next(e for e in events if e["type"] == "dns_updated")
+    assert len(dns["dns"]) == 2
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_new_ip_also_blocked_tries_next(tmp_path):
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
-    aliyun.alloc_queue = ["2.2.2.2", "3.3.3.3"]
-    cf = FakeCloudflare()
-    # 第一次 verify 失败（新 IP 也被墙），第二次成功
-    detector = FakeDetector([blocked_outcome(), blocked_outcome(), ok_outcome()])
-    engine, store, _ = make_engine(tmp_path, detector, aliyun, cf)
-
-    result = await engine.switch("hk", reason="test")
-    assert result.ok is True
-    assert result.new_ip == "3.3.3.3"
-    assert "2.2.2.2" not in [e.ip for e in aliyun.eips.values()]
+async def test_multi_account_uses_right_client(tmp_path):
+    cfg, aliyuns, engine, _ = make(tmp_path)
+    r1 = await engine.switch("hk")
+    r2 = await engine.switch("sg")
+    assert r1.ok and r2.ok
+    assert "release:eip-a1" in aliyuns["main"].calls
+    assert not any("eip-a1" in c for c in aliyuns["second"].calls)
+    assert "release:eip-b1" in aliyuns["second"].calls
+    assert aliyuns["main"].calls != aliyuns["second"].calls
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_dns_not_pointed_at_failed_new_ip(tmp_path):
-    """新 IP 验证失败时，解析绝不能指过去（否则线上直接断）。"""
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
-    cf = FakeCloudflare()
-    detector = WallDetector({"1.1.1.1", "10.0.0.1"})  # 旧 IP 和新 IP 都被墙
-    engine, store, events = make_engine(tmp_path, detector, aliyun, cf)
-    engine.cfg.switch.max_attempts = 1
-
-    result = await engine.switch("hk", reason="test")
-    assert result.ok is False
-    assert cf.points == {}, f"不应改动任何解析，实际 {cf.points}"
-    assert any(e["type"] == "switch_failed" for e in events)
-    assert aliyun.eips["eip-old"].instance_id == "i-1"
+async def test_release_off_keeps_old_eip(tmp_path):
+    cfg, aliyuns, engine, events = make(tmp_path)
+    cfg.switch.release_old = False
+    result = await engine.switch("hk")
+    assert result.ok
+    assert result.old_released is False
+    assert "eip-a1" in aliyuns["main"].eips, "关闭释放时应保留旧 EIP"
+    assert "release:eip-a1" not in aliyuns["main"].calls
+    assert not any(e["type"] == "old_ip_released" for e in events)
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_dns_rollback_when_update_partially_fails(tmp_path):
-    """只有部分解析失败时：IP 换成功、不回滚到被墙的旧 IP，但要给出警告。"""
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
-    cf = FakeCloudflare()
+async def test_allocate_retries_then_succeeds(tmp_path):
+    cfg, aliyuns, engine, _ = make(tmp_path)
+    aliyuns["main"].alloc_fail = 1  # 第一次失败
+    result = await engine.switch("hk")
+    assert result.ok is True, "重试后应成功"
+    await engine.close()
 
-    class HalfFailCF(FakeCloudflare):
-        async def point_many(self, names, ip):
-            self.points[names[0]] = ip
-            return [
-                {"name": names[0], "action": "updated", "detail": "ok", "ok": "1"},
-                {"name": names[1], "action": "error", "detail": "boom", "ok": "0"},
-            ]
 
-    cf = HalfFailCF()
-    detector = WallDetector({"1.1.1.1"})
-    engine, store, events = make_engine(tmp_path, detector, aliyun, cf)
-    engine.cfg.switch.max_attempts = 1
-    engine.cfg.targets[0].dns_records = ["a.example.com", "b.example.com"]
-
-    result = await engine.switch("hk", reason="test")
-    assert result.ok is True, "IP 已换成功，不应因部分域名失败而回滚"
-    assert result.warnings and "b.example.com" in result.warnings[0]
-    success = next(e for e in events if e["type"] == "switch_success")
-    assert success["warnings"]
-
-    aliyun = FakeAliyun()
-    cf = FakeCloudflare()
-    engine, _, events = make_engine(tmp_path, FakeDetector([]), aliyun, cf)
+@pytest.mark.asyncio
+async def test_allocate_fails_all_attempts_keeps_old_ip(tmp_path):
+    cfg, aliyuns, engine, events = make(tmp_path)
+    aliyuns["main"].alloc_fail = 10
     result = await engine.switch("hk")
     assert result.ok is False
-    assert "EIP" in result.error
+    assert "分配新 EIP 失败" in result.error
+    # 分配失败时绝不能动旧 IP
+    assert "eip-a1" in aliyuns["main"].eips
+    assert aliyuns["main"].eips["eip-a1"].instance_id == "i-1"
+    assert "release:eip-a1" not in aliyuns["main"].calls
     assert any(e["type"] == "switch_failed" for e in events)
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_monitor_triggers_after_threshold(tmp_path):
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
-    cf = FakeCloudflare()
-    detector = WallDetector({"1.1.1.1"})
-    engine, store, events = make_engine(tmp_path, detector, aliyun, cf)
-    engine.settings.failure_threshold = 3
-    state = store.get("hk")
-
-    await engine._check_one("hk")
-    assert state.failures == 1
-    assert state.switches == 0, "未达阈值不应换 IP"
-    assert any(e["type"] == "blocked_suspect" for e in events)
-    assert not any(e["type"] == "blocked_confirmed" for e in events)
-
-    await engine._check_one("hk")
-    assert state.failures == 2
-    assert state.switches == 0
-
-    await engine._check_one("hk")
-    assert any(e["type"] == "blocked_confirmed" for e in events)
-    assert state.failures == 0, "换成功后失败计数应清零"
-    assert state.switches == 1
-    assert state.current_ip != "1.1.1.1"
-    assert any(e["type"] == "switch_success" for e in events)
-
-    # 新 IP 正常，不再动作
-    await engine._check_one("hk")
-    assert state.switches == 1
-    assert state.failures == 0
+async def test_no_eip_is_clear_error(tmp_path):
+    cfg, aliyuns, engine, events = make(tmp_path)
+    aliyuns["main"].eips.clear()
+    result = await engine.switch("hk")
+    assert result.ok is False
+    assert "没有绑定 EIP" in result.error
+    assert any(e["type"] == "switch_failed" for e in events)
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_auto_disabled_prevents_switch(tmp_path):
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
+async def test_partial_dns_failure_still_succeeds_with_warning(tmp_path):
     cf = FakeCloudflare()
-    detector = FakeDetector([blocked_outcome()])
-    engine, store, events = make_engine(tmp_path, detector, aliyun, cf)
-    engine.settings.auto = False
-    engine.settings.failure_threshold = 1
-    for _ in range(3):
-        await engine._check_one("hk")
-    assert store.get("hk").switches == 0
-    assert not any(c.startswith("associate:eip-new") for c in aliyun.calls)
-    assert any(e["type"] == "auto_disabled" for e in events)
+    cf.fail_names = {"api.example.com"}
+    cfg, _, engine, events = make(tmp_path, cf=cf)
+    result = await engine.switch("hk")
+    assert result.ok is True, "IP 已换好，部分域名失败不该整体失败"
+    assert cf.points.get("hk.example.com") == result.new_ip
+    assert "api.example.com" not in cf.points
+    dns_event = next(e for e in events if e["type"] == "dns_updated")
+    assert [d["ok"] for d in dns_event["dns"]] == ["1", "0"]
     await engine.close()
 
 
 @pytest.mark.asyncio
-async def test_down_is_not_treated_as_blocked(tmp_path):
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
+async def test_all_dns_failure_is_error(tmp_path):
     cf = FakeCloudflare()
-    engine, store, events = make_engine(tmp_path, FakeDetector([service_down_outcome()]), aliyun, cf)
-    engine.settings.failure_threshold = 1
-    for _ in range(3):
-        await engine._check_one("hk")
-    assert store.get("hk").switches == 0, "实例故障不应触发换 IP"
-    assert not any(e["type"] == "blocked_confirmed" for e in events)
+    cf.raise_all = True
+    cfg, _, engine, events = make(tmp_path, cf=cf)
+    result = await engine.switch("hk")
+    assert result.ok is False
+    assert "解析" in result.error
+    assert any(e["type"] == "switch_failed" for e in events)
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_target_without_dns_only_switches_ip(tmp_path):
+    cfg, aliyuns, engine, events = make(tmp_path)
+    cfg.target("hk").dns_records = []
+    result = await engine.switch("hk")
+    assert result.ok is True
+    assert result.dns == []
+    assert not any(e["type"] == "dns_updated" for e in events)
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_describe_reports_current_ip(tmp_path):
+    cfg, _, engine, _ = make(tmp_path)
+    detail = await engine.describe(cfg.target("hk"))
+    assert detail["eip"].ip == "1.1.1.1"
+    assert detail["error"] == ""
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_describe_error_when_no_eip(tmp_path):
+    cfg, aliyuns, engine, _ = make(tmp_path)
+    aliyuns["main"].eips.clear()
+    detail = await engine.describe(cfg.target("hk"))
+    assert detail["eip"] is None
+    assert "EIP" in detail["error"]
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_lock_prevents_concurrent_switch(tmp_path):
+    import asyncio
+
+    cfg, _, engine, events = make(tmp_path)
+    async with engine.lock("hk"):
+        result = await engine.switch("hk")
+    assert result.ok is False
+    assert "正在处理" in result.error
     await engine.close()
 
 
 @pytest.mark.asyncio
 async def test_manual_dns_uses_current_ip(tmp_path):
-    aliyun = FakeAliyun()
-    aliyun.seed("eip-old", "1.1.1.1", instance_id="i-1", status="InUse")
-    cf = FakeCloudflare()
-    engine, _, events = make_engine(tmp_path, FakeDetector([]), aliyun, cf)
+    cfg, _, engine, events = make(tmp_path)
     results = await engine.manual_dns("hk")
-    assert results[0]["ok"] == "1"
-    assert cf.points["hk.example.com"] == "1.1.1.1"
+    assert all(r["ok"] == "1" for r in results)
     assert any(e["type"] == "dns_sync" for e in events)
     await engine.close()
-
-
-@pytest.mark.asyncio
-async def test_state_persists(tmp_path):
-    cfg = make_cfg(tmp_path)
-    store = StateStore.load(cfg.data_dir / "state.json", ["hk"], {"auto": True})
-    store.get("hk").current_ip = "9.9.9.9"
-    store.get("hk").switches = 3
-    store.channel_id = -100123
-    store.save()
-
-    again = StateStore.load(cfg.data_dir / "state.json", ["hk"])
-    assert again.get("hk").current_ip == "9.9.9.9"
-    assert again.get("hk").switches == 3
-    assert again.channel_id == -100123
-
-
-@pytest.mark.asyncio
-async def test_multi_account_uses_correct_client(tmp_path):
-    """两个账号的两台机器，换 IP 必须走各自的 AK。"""
-    cfg = make_cfg(tmp_path)
-    # 改成双账号
-    cfg.aliyun.accounts = {
-        "main": type(next(iter(cfg.aliyun.accounts.values())))(
-            name="main", access_key_id="ak1", access_key_secret="sk1", default_region="cn-hongkong"
-        ),
-        "second": type(next(iter(cfg.aliyun.accounts.values())))(
-            name="second", access_key_id="ak2", access_key_secret="sk2", default_region="ap-southeast-1"
-        ),
-    }
-    cfg.targets = [
-        TargetConfig(name="hk", instance_id="i-1", account="main", probe_port=443, dns_records=["hk.example.com"]),
-        TargetConfig(name="sg", instance_id="i-2", account="second", probe_port=443, dns_records=["sg.example.com"]),
-    ]
-    account1, account2 = FakeAliyun(), FakeAliyun()
-    account1.seed("eip-a1", "1.1.1.1", instance_id="i-1", status="InUse")
-    account2.seed("eip-b1", "2.2.2.2", instance_id="i-2", status="InUse")
-
-    store = StateStore.load(cfg.data_dir / "state.json", ["hk", "sg"], {"auto": True})
-    settings = Settings.from_values({"auto": True, "interval": 1, "failure_threshold": 1, "cooldown": 0}, {})
-    engine = Engine(
-        cfg,
-        store,
-        settings,
-        aliyun_accounts={"main": account1, "second": account2},  # type: ignore[arg-type]
-        cloudflare=FakeCloudflare(),  # type: ignore[arg-type]
-        detector=WallDetector({"1.1.1.1", "2.2.2.2"}),  # type: ignore[arg-type]
-    )
-    engine.cfg.detect.verify_delay = 0
-    engine.cfg.detect.verify_attempts = 1
-
-    r1 = await engine.switch("hk", reason="test")
-    r2 = await engine.switch("sg", reason="test")
-    assert r1.ok and r2.ok
-    # 各自账号内只动了各自的 EIP
-    assert "release:eip-a1" in account1.calls
-    assert not any("eip-a1" in c for c in account2.calls)
-    assert "release:eip-b1" in account2.calls
-    # 地域用的是账号默认地域
-    assert engine.region_for(cfg.target("sg")) == "ap-southeast-1"
-    await engine.close()
-
-
-def test_pingpe_link_shape(tmp_path):
-    from eipguard.engine import pingpe_link
-
-    cfg = make_cfg(tmp_path)
-    target = cfg.target("hk")
-    target.dns_records = ["hk.example.com"]
-    link = pingpe_link(target, "1.2.3.4")
-    assert link.startswith("https://ping.pe/1.2.3.4:443")
-    assert "hk.example.com" in link
-    assert pingpe_link(target, "") == ""

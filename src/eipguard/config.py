@@ -1,3 +1,8 @@
+"""配置加载 / 校验 / 回写。
+
+支持多阿里云账号；配置可被 Telegram 机器人和 CLI 修改后写回 YAML。
+"""
+
 from __future__ import annotations
 
 import os
@@ -17,7 +22,6 @@ class ConfigError(RuntimeError):
 
 
 def _expand(value: Any, env: dict[str, str] | None = None) -> Any:
-    """递归展开 ${VAR} / ${VAR:-default}，并保留 None/数字/布尔类型。"""
     if isinstance(value, dict):
         return {k: _expand(v, env) for k, v in value.items()}
     if isinstance(value, list):
@@ -56,13 +60,6 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
-def _as_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _as_bool(value: Any, default: bool) -> bool:
     if value is None or value == "":
         return default
@@ -72,7 +69,6 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 
 def parse_id_list(raw: Any) -> tuple[int, ...]:
-    """支持 '123,456' 或 [123, '456']。"""
     if raw is None:
         return ()
     items: list[Any] = []
@@ -93,244 +89,122 @@ def parse_id_list(raw: Any) -> tuple[int, ...]:
 
 
 @dataclass
-class TargetConfig:
+class Account:
+    """一个阿里云账号。"""
+
     name: str
+    access_key_id: str
+    access_key_secret: str
+    region: str = "cn-hongkong"
+    endpoint: str = "vpc.aliyuncs.com"
+    api_version: str = "2016-04-28"
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "Account":
+        name = str(raw.get("name") or "").strip()
+        ak = str(raw.get("access_key_id") or "").strip()
+        sk = str(raw.get("access_key_secret") or "").strip()
+        if not name:
+            raise ConfigError("account 的 name 不能为空")
+        if not ak or not sk:
+            raise ConfigError(f"账号 {name} 缺 access_key_id / access_key_secret")
+        return cls(
+            name=name,
+            access_key_id=ak,
+            access_key_secret=sk,
+            region=str(raw.get("region") or raw.get("default_region") or "cn-hongkong"),
+            endpoint=str(raw.get("endpoint") or "vpc.aliyuncs.com"),
+            api_version=str(raw.get("api_version") or "2016-04-28"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "access_key_id": self.access_key_id,
+            "access_key_secret": self.access_key_secret,
+            "region": self.region,
+        }
+
+    def masked(self) -> str:
+        ak = self.access_key_id
+        shown = f"{ak[:8]}…{ak[-4:]}" if len(ak) > 14 else f"{ak[:4]}…"
+        return f"{self.name} · {shown} · {self.region}"
+
+
+@dataclass
+class Target:
+    """一台要换 IP 的实例。"""
+
+    name: str
+    account: str
     instance_id: str
-    account: str = "default"
     eip_allocation_id: str = ""
-    region_id: str = ""
-    probe_port: int = 0
-    aux_ports: list[int] = field(default_factory=list)
+    region: str = ""
     dns_records: list[str] = field(default_factory=list)
     notes: str = ""
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], default_port: int) -> "TargetConfig":
+    def from_dict(cls, raw: dict[str, Any]) -> "Target":
         name = str(raw.get("name") or "").strip()
         instance_id = str(raw.get("instance_id") or "").strip()
         if not name:
-            raise ConfigError("targets[].name 不能为空")
+            raise ConfigError("target 的 name 不能为空")
         if not instance_id:
             raise ConfigError(f"target {name}: instance_id 不能为空")
         records = raw.get("dns_records") or []
         if isinstance(records, str):
             records = [records]
-        aux_raw = raw.get("aux_ports") or []
-        if isinstance(aux_raw, str):
-            aux_raw = [x for x in aux_raw.replace("，", ",").split(",") if x.strip()]
-        probe_port = _as_int(raw.get("probe_port"), default_port)
-        aux_ports: list[int] = []
-        for item in aux_raw:
-            try:
-                port = int(item)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= port <= 65535 and port != probe_port and port not in aux_ports:
-                aux_ports.append(port)
         return cls(
             name=name,
-            instance_id=instance_id,
             account=str(raw.get("account") or "default").strip(),
+            instance_id=instance_id,
             eip_allocation_id=str(raw.get("eip_allocation_id") or "").strip(),
-            region_id=str(raw.get("region_id") or "").strip(),
-            probe_port=probe_port,
-            aux_ports=aux_ports,
+            region=str(raw.get("region") or "").strip(),
             dns_records=[str(r).strip() for r in records if str(r).strip()],
             notes=str(raw.get("notes") or "").strip(),
         )
 
-    def all_ports(self, default_port: int) -> list[int]:
-        """探测端口在最前，其余为辅助端口。"""
-        main = self.probe_port or default_port
-        return [main] + [p for p in self.aux_ports if p != main]
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "name": self.name,
+            "account": self.account,
+            "instance_id": self.instance_id,
+        }
+        if self.eip_allocation_id:
+            out["eip_allocation_id"] = self.eip_allocation_id
+        if self.region:
+            out["region"] = self.region
+        if self.dns_records:
+            out["dns_records"] = list(self.dns_records)
+        if self.notes:
+            out["notes"] = self.notes
+        return out
 
-
-def parse_agents(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """解析多探针配置，返回 [{url, token, zone, name}]。"""
-    if not raw:
-        return []
-    urls = raw.get("urls") or ""
-    if isinstance(urls, str):
-        urls = [u.strip() for u in urls.replace(";", ",").split(",") if u.strip()]
-    default_token = str(raw.get("token") or "").strip()
-    agents_raw = raw.get("agents")
-    if agents_raw:
-        out = []
-        for a in agents_raw:
-            url = str(a.get("url") or "").strip()
-            if not url:
-                continue
-            out.append(
-                {
-                    "url": url,
-                    "token": str(a.get("token") or default_token),
-                    "zone": str(a.get("zone") or "cn").lower(),
-                    "name": str(a.get("name") or ""),
-                }
-            )
-        if out:
-            return out
-    return [
-        {"url": u, "token": default_token, "zone": str(raw.get("zone") or "cn").lower(), "name": ""}
-        for u in urls
-    ]
-
-
-@dataclass
-class DetectConfig:
-    provider: str = "probe_agent"
-    port: int = 443
-    interval: int = 60
-    failure_threshold: int = 3
-    fail_ratio: float = 0.6
-    min_samples: int = 1
-    timeout: float = 6.0
-    attempts: int = 2
-    # 分层探测：icmp / tls / http。tcp 对每个端口必测，不用写。
-    layers: list[str] = field(default_factory=lambda: ["icmp", "tls"])
-    # 全局默认辅助端口；target 里也可单独写 aux_ports 覆盖
-    aux_ports: list[int] = field(default_factory=list)
-    # 需要 http 层时请求的路径（配合 tls 之上发真实请求）
-    http_path: str = "/"
-    verify_delay: int = 20
-    verify_attempts: int = 3
-    verify_success_needed: int = 1
-    probe_agents: list[dict[str, Any]] = field(default_factory=list)
-    checkhost_max_nodes: int = 6
-    checkhost_timeout: int = 20
-    # 反向探针（家宽/NAT 机器主动连过来），和服务端模式可同时用
-    hub_enabled: bool = False
-    hub_port: int = 8790
-    hub_token: str = ""
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any], default_port: int) -> "DetectConfig":
-        provider = str(raw.get("provider") or "probe_agent").lower()
-        if provider not in {"probe_agent", "checkhost", "hybrid", "tcp_self", "hub"}:
-            raise ConfigError(f"未知 detect.provider: {provider}")
-        agents = parse_agents(raw.get("probe_agent"))
-        hub_enabled = _as_bool((raw.get("hub") or {}).get("enabled"), False)
-        if provider in {"probe_agent", "hybrid"} and not agents and not hub_enabled:
-            raise ConfigError(
-                "detect.provider 需要探针，但 detect.probe_agent 为空"
-                "（家宽机器请改用反向模式：detect.hub.enabled: true）"
-            )
-        if provider == "hub" and not hub_enabled:
-            raise ConfigError("provider: hub 需要同时设置 detect.hub.enabled: true")
-
-        default_layers = ["icmp", "tls"]
-        layers_raw = raw.get("layers", default_layers)
-        if isinstance(layers_raw, str):
-            layers_raw = [x.strip().lower() for x in layers_raw.replace("，", ",").split(",") if x.strip()]
-        layers: list[str] = []
-        for layer in layers_raw or []:
-            name = str(layer).strip().lower()
-            if name not in {"icmp", "tcp", "tls", "http"}:
-                raise ConfigError(f"detect.layers 里有未知层：{name}（只支持 icmp/tcp/tls/http）")
-            if name not in layers:
-                layers.append(name)
-        if "tcp" not in layers:
-            layers.insert(0, "tcp")
-
-        aux_raw = raw.get("aux_ports") or []
-        if isinstance(aux_raw, str):
-            aux_raw = [x for x in aux_raw.replace("，", ",").split(",") if x.strip()]
-        aux_ports: list[int] = []
-        for item in aux_raw:
-            try:
-                port = int(item)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= port <= 65535 and port != _as_int(raw.get("port"), default_port):
-                aux_ports.append(port)
-
-        return cls(
-            provider=provider,
-            port=_as_int(raw.get("port"), default_port),
-            interval=max(15, _as_int(raw.get("interval"), 60)),
-            failure_threshold=max(1, _as_int(raw.get("failure_threshold"), 3)),
-            fail_ratio=min(1.0, max(0.0, _as_float(raw.get("fail_ratio"), 0.6))),
-            min_samples=max(1, _as_int(raw.get("min_samples"), 1)),
-            timeout=_as_float(raw.get("timeout"), 6.0),
-            attempts=max(1, min(5, _as_int(raw.get("attempts"), 2))),
-            layers=layers,
-            aux_ports=aux_ports,
-            http_path=str(raw.get("http_path") or "/"),
-            verify_delay=max(0, _as_int(raw.get("verify_delay"), 20)),
-            verify_attempts=max(1, _as_int(raw.get("verify_attempts"), 3)),
-            verify_success_needed=max(1, _as_int(raw.get("verify_success_needed"), 1)),
-            probe_agents=agents,
-            checkhost_max_nodes=_as_int(raw.get("checkhost_max_nodes"), 6),
-            checkhost_timeout=_as_int(raw.get("checkhost_timeout"), 20),
-            hub_enabled=_as_bool((raw.get("hub") or {}).get("enabled"), False),
-            hub_port=_as_int((raw.get("hub") or {}).get("port"), 8790),
-            hub_token=str((raw.get("hub") or {}).get("token") or "").strip(),
-        )
-
-
-@dataclass
-class SwitchConfig:
-    auto: bool = True
-    max_attempts: int = 3
-    cooldown: int = 900
-    release_old: bool = True
-    restore_old_on_failure: bool = True
-    internet_charge_type: str = ""
-    bandwidth_mbps: int | None = None
-    isp: str = ""
-    # 哪些结论允许自动换 IP。默认只有 ip_blocked（端口/TLS/数据面封锁换 IP 无效）
-    auto_switch_on: list[str] = field(default_factory=lambda: ["ip_blocked"])
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "SwitchConfig":
-        bw = raw.get("bandwidth_mbps")
-        allowed = raw.get("auto_switch_on")
-        if allowed is None:
-            verdicts = ["ip_blocked"]
-        elif isinstance(allowed, str):
-            verdicts = [x.strip().lower() for x in allowed.replace("，", ",").split(",") if x.strip()]
-        else:
-            verdicts = [str(x).strip().lower() for x in allowed if str(x).strip()]
-        return cls(
-            auto=_as_bool(raw.get("auto"), True),
-            max_attempts=max(1, _as_int(raw.get("max_attempts"), 3)),
-            cooldown=max(0, _as_int(raw.get("cooldown"), 900)),
-            release_old=_as_bool(raw.get("release_old"), True),
-            restore_old_on_failure=_as_bool(raw.get("restore_old_on_failure"), True),
-            internet_charge_type=str(raw.get("internet_charge_type") or "").strip(),
-            bandwidth_mbps=_as_int(bw, 0) or None,
-            isp=str(raw.get("isp") or "").strip(),
-            auto_switch_on=verdicts,
-        )
+    def brief(self) -> str:
+        dns = ", ".join(self.dns_records) if self.dns_records else "无域名"
+        return f"{self.name} · {self.account} · {self.instance_id} · {dns}"
 
 
 @dataclass
 class CloudflareConfig:
-    api_token: str
+    api_token: str = ""
     zone_id: str = ""
     zone_name: str = ""
     ttl: int = 60
     proxied: bool = False
     create_missing: bool = True
-    multi_record_policy: str = "replace"  # replace | keep
+    multi_record_policy: str = "replace"
     api_base: str = "https://api.cloudflare.com/client/v4"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "CloudflareConfig":
-        token = str(raw.get("api_token") or "").strip()
-        zone_id = str(raw.get("zone_id") or "").strip()
-        zone_name = str(raw.get("zone_name") or "").strip()
-        if not token:
-            raise ConfigError("cloudflare.api_token 为空（CF_API_TOKEN）")
-        if not zone_id and not zone_name:
-            raise ConfigError("cloudflare.zone_id 与 zone_name 至少填一个")
         policy = str(raw.get("multi_record_policy") or "replace").lower()
         if policy not in {"replace", "keep"}:
             raise ConfigError("cloudflare.multi_record_policy 只能是 replace 或 keep")
         return cls(
-            api_token=token,
-            zone_id=zone_id,
-            zone_name=zone_name,
+            api_token=str(raw.get("api_token") or "").strip(),
+            zone_id=str(raw.get("zone_id") or "").strip(),
+            zone_name=str(raw.get("zone_name") or "").strip(),
             ttl=_as_int(raw.get("ttl"), 60) or 1,
             proxied=_as_bool(raw.get("proxied"), False),
             create_missing=_as_bool(raw.get("create_missing"), True),
@@ -338,131 +212,99 @@ class CloudflareConfig:
             api_base=str(raw.get("api_base") or cls.api_base).rstrip("/"),
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "api_token": self.api_token,
+            "zone_id": self.zone_id,
+            "zone_name": self.zone_name,
+            "ttl": self.ttl,
+            "proxied": self.proxied,
+            "create_missing": self.create_missing,
+            "multi_record_policy": self.multi_record_policy,
+        }
+
+    def validate(self) -> None:
+        if not self.api_token:
+            raise ConfigError("cloudflare.api_token 为空（用 /cf 或 .env 的 CF_API_TOKEN 设置）")
+        if not self.zone_id and not self.zone_name:
+            raise ConfigError("cloudflare.zone_id 与 zone_name 至少填一个")
+
 
 @dataclass
-class AliyunAccount:
-    name: str
-    access_key_id: str
-    access_key_secret: str
-    endpoint: str = "vpc.aliyuncs.com"
-    api_version: str = "2016-04-28"
-    default_region: str = "cn-hongkong"
+class SwitchConfig:
+    max_attempts: int = 3
+    release_old: bool = True
+    # 先释放旧 EIP 再绑定新 EIP（省几秒计费，但绑定失败会有短暂空窗）
+    release_before_bind: bool = True
+    internet_charge_type: str = ""
+    bandwidth_mbps: int | None = None
+    isp: str = ""
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], fallback_region: str) -> "AliyunAccount":
-        name = str(raw.get("name") or "").strip()
-        ak = str(raw.get("access_key_id") or "").strip()
-        sk = str(raw.get("access_key_secret") or "").strip()
-        if not name:
-            raise ConfigError("aliyun.accounts[].name 不能为空")
-        if not ak or not sk:
-            raise ConfigError(f"账号 {name} 缺 access_key_id / access_key_secret")
+    def from_dict(cls, raw: dict[str, Any]) -> "SwitchConfig":
+        bw = raw.get("bandwidth_mbps")
         return cls(
-            name=name,
-            access_key_id=ak,
-            access_key_secret=sk,
-            endpoint=str(raw.get("endpoint") or "vpc.aliyuncs.com"),
-            api_version=str(raw.get("api_version") or "2016-04-28"),
-            default_region=str(raw.get("default_region") or raw.get("region_id") or fallback_region),
+            max_attempts=max(1, _as_int(raw.get("max_attempts"), 3)),
+            release_old=_as_bool(raw.get("release_old"), True),
+            release_before_bind=_as_bool(raw.get("release_before_bind"), True),
+            internet_charge_type=str(raw.get("internet_charge_type") or "").strip(),
+            bandwidth_mbps=_as_int(bw, 0) or None,
+            isp=str(raw.get("isp") or "").strip(),
         )
 
-
-@dataclass
-class AliyunConfig:
-    """支持多个阿里云账号；targets 里用 account 指定用哪个。"""
-
-    accounts: dict[str, AliyunAccount] = field(default_factory=dict)
-    region_id: str = "cn-hongkong"
-
-    def __post_init__(self) -> None:
-        # 兼容旧写法：单账号直接放在 aliyun 下
-        pass
-
-    @property
-    def access_key_id(self) -> str:
-        first = next(iter(self.accounts.values()), None)
-        return first.access_key_id if first else ""
-
-    @property
-    def access_key_secret(self) -> str:
-        first = next(iter(self.accounts.values()), None)
-        return first.access_key_secret if first else ""
-
-    @property
-    def endpoint(self) -> str:
-        first = next(iter(self.accounts.values()), None)
-        return first.endpoint if first else "vpc.aliyuncs.com"
-
-    @property
-    def api_version(self) -> str:
-        first = next(iter(self.accounts.values()), None)
-        return first.api_version if first else "2016-04-28"
-
-    def account(self, name: str) -> AliyunAccount:
-        if name in self.accounts:
-            return self.accounts[name]
-        raise ConfigError(f"target 引用了不存在的阿里云账号：{name}（已配置：{', '.join(self.accounts)}）")
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "AliyunConfig":
-        region = str(raw.get("region_id") or raw.get("default_region") or "cn-hongkong")
-        accounts_raw = raw.get("accounts")
-        accounts: dict[str, AliyunAccount] = {}
-        if accounts_raw:
-            if not isinstance(accounts_raw, list):
-                raise ConfigError("aliyun.accounts 必须是列表")
-            for item in accounts_raw:
-                if not isinstance(item, dict):
-                    raise ConfigError("aliyun.accounts[] 必须是对象")
-                account = AliyunAccount.from_dict(item, region)
-                if account.name in accounts:
-                    raise ConfigError(f"阿里云账号重名：{account.name}")
-                accounts[account.name] = account
-        else:
-            ak = str(raw.get("access_key_id") or "").strip()
-            sk = str(raw.get("access_key_secret") or "").strip()
-            if not ak or not sk:
-                raise ConfigError("缺少 aliyun.accounts，或 access_key_id / access_key_secret")
-            accounts["default"] = AliyunAccount(
-                name="default",
-                access_key_id=ak,
-                access_key_secret=sk,
-                endpoint=str(raw.get("endpoint") or "vpc.aliyuncs.com"),
-                api_version=str(raw.get("api_version") or "2016-04-28"),
-                default_region=region,
-            )
-        return cls(accounts=accounts, region_id=region)
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_attempts": self.max_attempts,
+            "release_old": self.release_old,
+            "release_before_bind": self.release_before_bind,
+            "internet_charge_type": self.internet_charge_type,
+            "bandwidth_mbps": self.bandwidth_mbps,
+            "isp": self.isp,
+        }
 
 
 @dataclass
 class Config:
     path: Path
     telegram_token: str
-    admin_chat_ids: tuple[int, ...]
-    channel_id: int | None
-    aliyun: AliyunConfig
-    cloudflare: CloudflareConfig
-    detect: DetectConfig
-    switch: SwitchConfig
-    targets: list[TargetConfig]
-    data_dir: Path
+    admin_chat_ids: tuple[int, ...] = ()
+    channel_id: int | None = None
+    bind_token: str = ""
+    tg_proxy: str = ""
+    accounts: dict[str, Account] = field(default_factory=dict)
+    targets: list[Target] = field(default_factory=list)
+    cloudflare: CloudflareConfig = field(default_factory=CloudflareConfig)
+    switch: SwitchConfig = field(default_factory=SwitchConfig)
+    data_dir: Path = Path("./data")
     timezone: str = "Asia/Shanghai"
     log_level: str = "INFO"
-    bind_token: str = ""
-    # 机器人所在机器连不上 Telegram 时用的代理，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
-    tg_proxy: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
 
-    def target(self, name: str) -> TargetConfig:
-        for t in self.targets:
-            if t.name == name:
-                return t
+    # ------------------------------------------------------------------ 查询
+    def target(self, name: str) -> Target:
+        for item in self.targets:
+            if item.name == name:
+                return item
         raise KeyError(name)
 
+    def target_names(self) -> list[str]:
+        return [t.name for t in self.targets]
+
+    def account(self, name: str) -> Account:
+        if name in self.accounts:
+            return self.accounts[name]
+        raise ConfigError(f"账号不存在：{name}（已有：{', '.join(self.accounts) or '无'}）")
+
+    def region_for(self, target: Target) -> str:
+        if target.region:
+            return target.region
+        return self.account(target.account).region
+
+    # ------------------------------------------------------------------ 加载
     @classmethod
     def load(cls, path: str | Path, env_file: str | Path | None = None) -> "Config":
         cfg_path = Path(path).expanduser().resolve()
         env_path = Path(env_file).expanduser().resolve() if env_file else cfg_path.parent / ".env"
-        # 不修改 os.environ：同一进程跑多份配置、或测试时互不污染
         env: dict[str, str] = dict(os.environ)
         if env_path.exists():
             env.update({k: v for k, v in dotenv_values(env_path).items() if v is not None})
@@ -470,36 +312,36 @@ class Config:
         if not cfg_path.exists():
             raise ConfigError(f"配置文件不存在：{cfg_path}")
         with cfg_path.open("r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
-        raw = _expand(raw, env)
+            raw_original = yaml.safe_load(fh) or {}
+        raw = _expand(raw_original, env)
 
         tg = raw.get("telegram") or {}
         token = str(tg.get("token") or "").strip()
         if not token:
-            raise ConfigError("telegram.token 为空（TG_BOT_TOKEN）")
+            raise ConfigError("telegram.token 为空（检查 .env 的 TG_BOT_TOKEN）")
         channel = tg.get("channel_id")
         channel_id = int(str(channel).strip()) if channel not in (None, "") else None
 
-        detect_default_port = _as_int((raw.get("web") or {}).get("port"), 443)
-        detect = DetectConfig.from_dict(raw.get("detect") or {}, detect_default_port)
-        targets_raw = raw.get("targets") or []
-        if not targets_raw:
-            raise ConfigError("targets 至少配置一个实例")
-        targets = [TargetConfig.from_dict(t, detect.port) for t in targets_raw]
+        accounts_raw = (raw.get("aliyun") or {}).get("accounts") or []
+        accounts: dict[str, Account] = {}
+        for item in accounts_raw:
+            if not isinstance(item, dict):
+                raise ConfigError("aliyun.accounts[] 必须是对象")
+            account = Account.from_dict(item)
+            if account.name in accounts:
+                raise ConfigError(f"阿里云账号重名：{account.name}")
+            accounts[account.name] = account
+
+        targets = [Target.from_dict(t) for t in (raw.get("targets") or [])]
         names = [t.name for t in targets]
         if len(set(names)) != len(names):
             raise ConfigError("targets[].name 不能重复")
-
-        aliyun = AliyunConfig.from_dict(raw.get("aliyun") or {})
         for target in targets:
-            if target.account not in aliyun.accounts:
+            if accounts and target.account not in accounts:
                 raise ConfigError(
-                    f"target {target.name} 的 account='{target.account}' 不存在。"
-                    f"已配置账号：{', '.join(aliyun.accounts)}"
+                    f"target {target.name} 引用了不存在的账号 {target.account}"
+                    f"（已有：{', '.join(accounts)}）"
                 )
-            # 没写 aux_ports 时用全局的
-            if not target.aux_ports and detect.aux_ports:
-                target.aux_ports = list(detect.aux_ports)
 
         data_dir = Path(str(raw.get("data_dir") or "./data")).expanduser()
         if not data_dir.is_absolute():
@@ -510,14 +352,44 @@ class Config:
             telegram_token=token,
             admin_chat_ids=parse_id_list(tg.get("admin_chat_ids")),
             channel_id=channel_id,
-            aliyun=aliyun,
-            cloudflare=CloudflareConfig.from_dict(raw.get("cloudflare") or {}),
-            detect=detect,
-            switch=SwitchConfig.from_dict(raw.get("switch") or {}),
+            bind_token=str(tg.get("bind_token") or "").strip(),
+            tg_proxy=str(tg.get("proxy") or "").strip(),
+            accounts=accounts,
             targets=targets,
+            cloudflare=CloudflareConfig.from_dict(raw.get("cloudflare") or {}),
+            switch=SwitchConfig.from_dict(raw.get("switch") or {}),
             data_dir=data_dir,
             timezone=str(raw.get("timezone") or "Asia/Shanghai"),
             log_level=str(raw.get("log_level") or "INFO"),
-            bind_token=str(tg.get("bind_token") or "").strip(),
-            tg_proxy=str(tg.get("proxy") or "").strip(),
+            raw=raw_original,
         )
+
+    # ------------------------------------------------------------------ 回写
+    def save(self) -> None:
+        """把当前状态写回 YAML。
+
+        注意：YAML 里的 ${VAR} 占位符会变成实际值——因为 TG 里新增的账号必须落盘。
+        因此写回后 .env 不再被这些字段引用，密钥只存在于 config.yaml（权限 600）。
+        """
+        payload: dict[str, Any] = {
+            "telegram": {
+                "token": self.telegram_token,
+                "admin_chat_ids": ",".join(str(i) for i in self.admin_chat_ids),
+                "bind_token": self.bind_token,
+                "channel_id": self.channel_id or "",
+                "proxy": self.tg_proxy,
+            },
+            "aliyun": {"accounts": [a.to_dict() for a in self.accounts.values()]},
+            "cloudflare": self.cloudflare.to_dict(),
+            "switch": self.switch.to_dict(),
+            "timezone": self.timezone,
+            "data_dir": str(self.data_dir),
+            "log_level": self.log_level,
+            "targets": [t.to_dict() for t in self.targets],
+        }
+        tmp = self.path.with_suffix(".yaml.tmp")
+        tmp.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), "utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+        # 回写后 raw 与磁盘一致，避免后续 save 覆盖丢失
+        self.raw = payload

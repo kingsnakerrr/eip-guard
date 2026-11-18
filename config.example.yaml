@@ -1,146 +1,64 @@
 # EIP Guard 配置文件。复制为 config.yaml 后修改。
-# ${VAR} 会被 .env / 环境变量替换；${VAR:-默认值} 支持默认值。
+# 也可以只填 telegram.token，其余全部在 Telegram 里用命令添加。
+# ${VAR} 会被 .env / 环境变量替换。
 
 telegram:
   token: "${TG_BOT_TOKEN}"
-  # 管理员 chat id（数字）。留空则用 /bind <口令> 绑定第一个管理员
+  # 管理员 chat id（数字，逗号分隔）。第一次用可以在服务器执行：
+  #   eipguard bind 你的chatid
+  # 或启动后私聊机器人发 /bind 口令
   admin_chat_ids: "${TG_ADMIN_IDS:-}"
-  # 首次绑定的口令（防止别人抢先绑定）。绑定后建议删掉
+  # /bind 用的口令（可空）
   bind_token: "${TG_BIND_TOKEN:-}"
-  # 通知频道；运行时可用 /channel 覆盖
+  # 通知频道；也可以之后在 TG 里 /channel -100xxxxxxxxxx
   channel_id: "${TG_CHANNEL_ID:-}"
-  # 机器人所在机器连不上 Telegram 时的代理（国内机器常见，留空不用）
-  # 例：http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
+  # 服务器连不上 Telegram 时的代理（国内机器必填），例如 socks5://127.0.0.1:1080
   proxy: "${TG_PROXY:-}"
 
-# ---------------- 阿里云账号（可以有多个）----------------
-# target 里用 account: 账号名 指定这台机器在哪个账号下
+# ---------------- 阿里云账号（多账号）----------------
+# 也可以完全留空，之后在 TG 里 /account add 添加。
+# 建议每个账号用 RAM 子账号，只给 EIP 权限（见 docs/aliyun-ram-policy.json）。
 aliyun:
-  accounts:
-    - name: "main"
-      access_key_id: "${ALIYUN_AK_ID}"
-      access_key_secret: "${ALIYUN_AK_SECRET}"
-      default_region: "cn-hongkong"     # 该账号的默认地域
-    - name: "second"                     # 你的第二个号
-      access_key_id: "${ALIYUN_AK_ID_2}"
-      access_key_secret: "${ALIYUN_AK_SECRET_2}"
-      default_region: "cn-hongkong"
+  accounts: []
+  # 示例：
+  # accounts:
+  #   - name: "main"
+  #     access_key_id: "${ALIYUN_AK_ID}"
+  #     access_key_secret: "${ALIYUN_AK_SECRET}"
+  #     region: "cn-hongkong"
 
-# 日志时区，只影响消息里的时间显示
+# ---------------- Cloudflare ----------------
+# 也可以留空，之后在 TG 里 /cf TOKEN 域名
+cloudflare:
+  api_token: "${CF_API_TOKEN:-}"
+  zone_name: "${CF_ZONE_NAME:-}"     # 例如 example.com
+  zone_id: ""                        # 填了 zone_name 会自动查
+  ttl: 60                            # 秒，建议 60 让新 IP 尽快生效
+  proxied: false                     # 换 IP 直连就 false；开小黄云则 true
+  create_missing: true               # 记录不存在时自动创建
+  multi_record_policy: replace       # replace=所有 A 记录都改；keep=只改第一条
+
+# ---------------- 换 IP 行为 ----------------
+switch:
+  # 换完是否释放旧 EIP（停止计费）。强烈建议 true。
+  release_old: true
+  # 分配新 EIP 失败时重试几次
+  max_attempts: 3
+  # 留空 = 沿用阿里云默认（按流量计费）
+  internet_charge_type: ""
+  bandwidth_mbps: null
+  isp: ""
+
+# ---------------- 实例（也可以之后 /target add）----------------
+targets: []
+# 示例：
+# targets:
+#   - name: "hk-main"
+#     account: "main"
+#     instance_id: "i-j6cxxxxxxxxxxxxxxxx"
+#     dns_records: ["hk.example.com", "api.example.com"]
+#     notes: "香港主站"
+
 timezone: "Asia/Shanghai"
 data_dir: "./data"
 log_level: "INFO"
-
-cloudflare:
-  api_token: "${CF_API_TOKEN}"
-  # zone_id 与 zone_name 二选一；填 name 会自动查询 zone id
-  zone_id: ""
-  zone_name: "example.com"
-  # 记录 TTL（秒），建议 60 以便被墙后快速生效；1 = 自动
-  ttl: 60
-  # 是否开启 Cloudflare 小黄云。如果换 IP 是为了直连（不走 CF），请设 false
-  proxied: false
-  # 记录不存在时自动创建
-  create_missing: true
-
-detect:
-  # 检测方式：probe_agent（自建国内外探针，最可靠）/ checkhost（免费公共 API）/ hybrid
-  provider: "probe_agent"
-  # 默认探测端口，target 可覆盖（就是你的业务端口，比如 443）
-  port: 443
-  # 多少秒检查一轮
-  interval: 60
-  # 连续多少轮判定异常才动作（防抖）
-  failure_threshold: 3
-  # 单次探测：判定“异常”所需的失败样本占比
-  fail_ratio: 0.6
-  timeout: 6.0
-  # 每个探针每层探测几次（任一次成功即视为该层通）
-  attempts: 2
-  # 可选层：icmp（ping）、tls（握手，查 SNI 阻断）、http（查数据面）。
-  # 注意：tcp 对每个端口一定会测，不用写。
-  layers: ["icmp", "tls"]
-  # 全局默认辅助端口。用来区分「整台 IP 被封」和「只封了业务端口」。
-  # 填这台机器上真实开放的其它端口（SSH 22、备用 Web 80、面板 8443…）
-  aux_ports: [22, 80]
-  # 需要 http 层时的请求路径
-  http_path: "/"
-  # 更换后验证
-  verify_delay: 20
-  verify_attempts: 3
-  verify_success_needed: 1
-
-  # ---------- 反向探针（家宽/NAT 机器用这个）----------
-  # 家里那台没有公网 IP 时，让它主动连过来。主程序不需要能访问它。
-  # 开启后，家里那台跑：
-  #   PROBE_TOKEN=xxx ZONE=cn python3 probe_agent/client.py --hub ws://本机公网IP:8790
-  hub:
-    enabled: false        # 用反向模式就改成 true
-    port: 8790            # 记得在安全组/防火墙放行
-    token: "${PROBE_AGENT_TOKEN:-}"
-
-  # ---------- 普通探针（有公网 IP 的机器用）----------
-  probe_agent:
-    # 判定的核心就是「同一端口，国内不通 + 国外通」
-    # 两种模式可以混用：比如国内用 hub（家宽），国外用直连（VPS）
-    agents:
-      - url: "${PROBE_CN_URL}"
-        token: "${PROBE_AGENT_TOKEN}"
-        zone: "cn"
-        name: "cn-probe"
-      - url: "${PROBE_OS_URL}"
-        token: "${PROBE_AGENT_TOKEN}"
-        zone: "overseas"
-        name: "os-probe"
-
-  checkhost:
-    max_nodes: 6
-    timeout: 20
-
-switch:
-  # 是否自动更换；机器人里也能开关
-  auto: true
-  # 只有这些判定结论才允许自动换 IP。
-  # 默认只有 ip_blocked；端口封锁换 IP 往往无效，所以不默认换。
-  # 想更激进可以写 ["ip_blocked", "port_blocked"]
-  auto_switch_on: ["ip_blocked"]
-  # 一次被墙事件最多尝试几个新 IP
-  max_attempts: 3
-  # 两次更换之间的最小间隔（秒），避免抖动
-  cooldown: 900
-  # 成功后释放旧 EIP（省钱；设 false 会继续收未绑定 EIP 的费用）
-  release_old: true
-  # 全部尝试失败时，把旧 EIP 重新绑回去
-  restore_old_on_failure: true
-  # 新 EIP 分配参数：留空表示沿用旧 EIP 的计费方式和带宽
-  internet_charge_type: ""     # PayByTraffic / PayByBandwidth
-  bandwidth_mbps: null         # 例如 100
-  # 分配时尽量指定线路，留空用 BGP
-  isp: ""
-
-targets:
-  - name: "hk-main"
-    account: "main"                      # 用哪个阿里云账号
-    instance_id: "i-j6cxxxxxxxxxxxxxxxx"
-    # 可选：不填会自动按实例查找绑定中的 EIP
-    eip_allocation_id: "eip-j6cxxxxxxxxxxxxxxxx"
-    # 可选：单独指定地域（覆盖账号默认地域）
-    # region_id: "cn-hongkong"
-    # 业务端口；不填用 detect.port
-    probe_port: 443
-    # 可选：这台机器上真实开放的其它端口，覆盖全局 detect.aux_ports
-    aux_ports: [22, 80]
-    # 需要跟随新 IP 的域名记录（相对 zone 或完整域名均可）
-    dns_records:
-      - "hk.example.com"
-      - "api.example.com"
-    notes: "香港主站"
-
-  - name: "sg-second"
-    account: "second"                    # 第二个阿里云账号的机器
-    instance_id: "i-t4nxxxxxxxxxxxxxxxx"
-    probe_port: 443
-    aux_ports: [22]
-    dns_records:
-      - "sg.example.com"
-    notes: "新加坡备用"

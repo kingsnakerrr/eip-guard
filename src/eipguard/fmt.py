@@ -4,9 +4,6 @@ import html
 import time
 from typing import Any
 
-from .detect.probe import VERDICT_ADVICE, VERDICT_ICONS, VERDICT_LABELS, ProbeOutcome, Verdict
-from .state import TargetState
-
 
 def esc(text: Any) -> str:
     return html.escape(str(text), quote=False)
@@ -33,313 +30,270 @@ def ago(epoch: float | None) -> str:
     return f"{delta // 86400}d 前"
 
 
-def health_icon(state: TargetState) -> str:
-    if state.failures <= 0:
-        return "🟢"
-    try:
-        return VERDICT_ICONS[Verdict(state.last_verdict)]
-    except (ValueError, KeyError):
-        return "🟠"
-
-
-def probe_lines(probe: ProbeOutcome | None) -> str:
-    if not probe:
+def pingpe_line(ip: str, port: int = 0, host: str = "") -> str:
+    """人工复核链接。"""
+    if not ip:
         return ""
-    lines = [f"{probe.icon} 判定：<b>{esc(probe.label)}</b> — {esc(probe.reason)}"]
-    for node in probe.nodes:
-        lines.append(f"   • {esc(node.brief())}")
-    return "\n".join(lines)
+    url = f"https://ping.pe/{ip}:{port}" if port else f"https://ping.pe/{ip}"
+    if host:
+        url += f"?host={host}"
+    return f'🔗 <a href="{esc(url)}">ping.pe 自查</a>'
 
 
-def port_matrix(probe: ProbeOutcome | None) -> str:
-    """国内外端口对照表 —— 这就是 ping.pe 给出的那种信息，只是自动跑。"""
-    if not probe or not probe.ports:
-        return ""
-    lines = ["<b>端口对照</b>（国内 / 国外）"]
-    for item in probe.ports:
-        mark = " ← 节点端口" if item.port == probe.node_port else ""
-        if item.cn == "fail" and item.os == "ok":
-            hint = "被墙"
-        elif item.os == "fail":
-            hint = "服务本身不通"
-        elif item.cn == "ok":
-            hint = "正常"
-        elif item.cn == "fail" and item.os == "untested":
-            hint = "国外未测"
-        else:
-            hint = ""
-        suffix = f" · {hint}" if hint else ""
-        lines.append(f"  {item.line()}{suffix}{mark}")
-    icmp = f"ICMP 国内 {probe.icmp_cn} / 国外 {probe.icmp_os}"
-    icmp = icmp.replace("ok", "通").replace("fail", "不通").replace("untested", "未测")
-    lines.append(f"  {icmp}")
-    return "\n".join(lines)
-
-
-def status_block(name: str, state: TargetState, detail: dict[str, Any], auto: bool, threshold: int) -> str:
-    target = detail["target"]
-    eip = detail.get("eip")
-    probe = detail.get("probe")
+# ---------------------------------------------------------------- 进度推送
+def started_text(ev: dict[str, Any]) -> str:
+    dns = ev.get("dns") or []
     lines = [
-        f"{health_icon(state)} <b>{esc(name)}</b>"
-        + (f" · {esc(target.notes)}" if target.notes else ""),
-        f"  实例 <code>{esc(target.instance_id)}</code> · 账号 {esc(target.account)}",
-    ]
-    if eip:
-        bound = f" → {esc(eip.instance_id)}" if eip.instance_id else " （未绑定）"
-        lines.append(f"  IP <code>{esc(eip.ip)}</code>{bound}")
-        lines.append(f"  EIP <code>{esc(eip.allocation_id)}</code> · {esc(eip.status or '?')}")
-    elif detail.get("error"):
-        lines.append(f"  ⚠️ {esc(detail['error'])}")
-    if target.dns_records:
-        ports = ", ".join(str(p) for p in target.all_ports(detail.get("port") or 443))
-        lines.append(f"  域名 {esc(', '.join(target.dns_records))}")
-        lines.append(f"  探测端口 {ports}")
-    lines.append(
-        f"  连续异常 {state.failures}/{threshold} · 自动换IP {'开' if auto else '关'}"
-        f" · 累计换 {state.switches} 次"
-    )
-    lines.append(f"  上次检查 {ago(state.last_check)} · 上次切换 {ago(state.last_switch)}")
-    if probe:
-        lines.append(probe_lines(probe))
-        matrix = port_matrix(probe)
-        if matrix:
-            lines.append(matrix)
-        if probe.advice:
-            lines.append(f"  💡 {esc(probe.advice)}")
-    elif state.last_reason:
-        lines.append(f"  上次结论：{esc(state.last_reason)}")
-    if state.paused_until and state.paused_until > time.time():
-        lines.append(f"  ⏸ 冷却中，{ago(state.paused_until)}解除")
-    return "\n".join(lines)
-
-
-def switch_success_text(ev: dict[str, Any]) -> str:
-    lines = [
-        "✅ <b>EIP 更换成功</b>",
+        "🔁 <b>开始更换 IP</b>",
         "",
         f"🎯 目标：<code>{esc(ev.get('target'))}</code>"
         + (f" · 账号 {esc(ev['account'])}" if ev.get("account") else ""),
-        f"📤 旧 IP：<code>{esc(ev.get('old_ip') or '-')}</code>",
-        f"📥 新 IP：<code>{esc(ev.get('new_ip') or '-')}</code>",
-        f"🧭 触发：{esc(ev.get('reason') or '自动检测')}",
+        f"📤 当前 IP：<code>{esc(ev.get('old_ip'))}</code>",
+        f"🧭 触发：{esc(ev.get('reason') or '手动')}",
     ]
-    dns = ev.get("dns") or []
     if dns:
-        ok = sum(1 for d in dns if d.get("ok") == "1")
-        lines.append(f"🌐 Cloudflare：{ok}/{len(dns)} 条已更新")
-        for d in dns:
-            mark = "✓" if d.get("ok") == "1" else "✗"
-            lines.append(f"   {mark} <code>{esc(d.get('name'))}</code> {esc(d.get('detail') or '')}")
-    if ev.get("detail"):
-        lines.append(f"🔎 验证：{esc(ev['detail'])}")
-    for warning in ev.get("warnings") or []:
-        lines.append(f"⚠️ {esc(warning)}")
-    elapsed = ev.get("elapsed")
-    if elapsed:
-        lines.append(f"⏱ 耗时 {elapsed:.1f}s")
-    lines.append(f"🕒 {ts(ev.get('ts'))}")
+        lines.append(f"🌐 待更新域名：{esc(', '.join(dns))}")
+    else:
+        lines.append("⚠️ 该目标未配置域名，只换 IP")
+    lines.append("")
+    lines.append("流程：分配新 IP → 释放旧 IP → 绑定 → 改 CF 解析")
     return "\n".join(lines)
 
 
-def switch_failed_text(ev: dict[str, Any]) -> str:
-    lines = [
-        "❌ <b>EIP 更换失败</b>",
-        "",
-        f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
-    ]
-    if ev.get("old_ip"):
-        lines.append(f"📤 旧 IP：<code>{esc(ev['old_ip'])}</code>")
-    lines.append(f"💥 原因：{esc(ev.get('error') or '未知')}")
-    dns = ev.get("dns") or []
-    if dns:
-        lines.append(f"🌐 DNS：{sum(1 for d in dns if d.get('ok') == '1')}/{len(dns)} 条成功")
-    for warning in ev.get("warnings") or []:
-        lines.append(f"⚠️ {esc(warning)}")
-    lines.append(f"🕒 {ts(ev.get('ts'))}")
-    return "\n".join(lines)
-
-
-def switch_started_text(ev: dict[str, Any]) -> str:
-    tag = "（手动）" if ev.get("manual") else "（自动）"
+def allocated_text(ev: dict[str, Any]) -> str:
     return "\n".join(
         [
-            f"🔁 <b>开始更换 EIP</b>{tag}",
+            "✅ <b>已分配新 IP</b>",
             "",
             f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
-            f"📤 当前 IP：<code>{esc(ev.get('old_ip'))}</code>",
-            f"🧭 原因：{esc(ev.get('reason'))}",
-            f"🔎 {esc(ev.get('detail') or '')}",
-            f"🕒 {ts(ev.get('ts'))}",
+            f"📥 新 IP：<code>{esc(ev.get('new_ip'))}</code>",
+            f"🆔 EIP：<code>{esc(ev.get('new_allocation_id'))}</code>",
+            "",
+            "下一步：释放旧 IP → 绑定新 IP",
         ]
     )
 
 
-def blocked_text(ev: dict[str, Any]) -> str:
-    verdict = str(ev.get("verdict") or "")
-    try:
-        label = VERDICT_LABELS[Verdict(verdict)]
-        icon = VERDICT_ICONS[Verdict(verdict)]
-    except (ValueError, KeyError):
-        label = str(ev.get("label") or "探测异常")
-        icon = "⚠️"
-
-    will = bool(ev.get("will_switch"))
-    switchable = bool(ev.get("switchable", True))
-    if will:
-        title = f"{icon} <b>{esc(label)}，已确认，准备更换 IP</b>"
-    elif not switchable:
-        title = f"{icon} <b>{esc(label)}</b>（换 IP 无效，不自动更换）"
-    else:
-        title = f"{icon} <b>{esc(label)}</b>"
-
-    lines = [
-        title,
-        "",
-        f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
-        f"📤 IP：<code>{esc(ev.get('ip'))}</code>",
-    ]
-    if ev.get("count") and ev.get("threshold"):
-        lines.append(f"📉 连续异常 {ev['count']}/{ev['threshold']} 次")
-    lines.append(f"🔎 {esc(ev.get('detail') or '')}")
-    if ev.get("matrix"):
-        lines.append(str(ev["matrix"]))
-    if ev.get("advice"):
-        lines.append(f"💡 建议：{esc(ev['advice'])}")
-    if will:
-        lines.append("🔄 正在自动更换 IP…")
-    elif not switchable:
-        lines.append("ℹ️ 这类问题换 IP 解决不了，见上建议。确认仍要换可发 /switch。")
-    elif ev.get("auto_off"):
-        lines.append("ℹ️ 该目标自动换 IP 已关闭，需要手动 /switch。")
-    else:
-        lines.append("ℹ️ 尚未达到阈值，暂不动作。")
-    if ev.get("pingpe"):
-        lines.append(f"🔗 自查：{ev['pingpe']}")
-    lines.append(f"🕒 {ts(ev.get('ts'))}")
-    return "\n".join(lines)
-
-
-def verdict_definitions_text() -> str:
-    lines = ["<b>判定定义</b>", "", "<b>核心规则</b>：同一个端口，国内测一次、国外测一次。"]
-    lines.append("")
-    rows = [
-        (Verdict.IP_BLOCKED, "国内连不上、国外能连，且这台 IP 没有别的端口能从国内连上", "换 IP 有效"),
-        (Verdict.PORT_BLOCKED, "只有这个端口国内不通，同 IP 其它端口国内能连", "换端口最有效，换 IP 也可能有用"),
-        (Verdict.TLS_BLOCKED, "TCP 能连，TLS 握手被断，国外 TLS 正常", "换 IP 无效，按 SNI/域名阻断"),
-        (Verdict.DATA_BLOCKED, "TCP 与 TLS 都通，一传 HTTP 数据就被断", "换 IP 无效，按流量特征阻断"),
-        (Verdict.SERVICE_DOWN, "这个端口国内外都连不上", "服务没起/安全组/防火墙，换 IP 无效"),
-        (Verdict.OK, "国内能正常连上", "—"),
-        (Verdict.UNKNOWN, "缺国内或国外探针，没法对比", "补探针"),
-    ]
-    for verdict, desc, action in rows:
-        lines.append(f"{VERDICT_ICONS[verdict]} <b>{VERDICT_LABELS[verdict]}</b>：{desc}")
-        if action != "—":
-            lines.append(f"    → {action}")
-    lines.append("")
-    lines.append("<b>为什么不能靠 22 端口判断</b>：")
-    lines.append("  • 22 通、443 不通 → 可能只是 443 服务挂了，也可能只封了 443")
-    lines.append("  • 22 也不通 → 可能 22 被封，也可能 SSH 挂了")
-    lines.append("  两种情况都说明不了 IP 是否被墙。只有「同一端口国内不通 + 国外通」才是墙。")
-    lines.append("")
-    lines.append("自动换 IP 只在判定为「IP 被墙」时触发（可在 switch.auto_switch_on 里加其它类型）。")
-    return "\n".join(lines)
-
-
-def recovered_text(ev: dict[str, Any]) -> str:
+def released_text(ev: dict[str, Any]) -> str:
     return "\n".join(
         [
-            "✅ <b>已恢复正常</b>",
+            "✅ <b>旧 IP 已释放（停止计费）</b>",
             "",
             f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
-            f"📥 IP：<code>{esc(ev.get('ip'))}</code>",
-            f"🔎 {esc(ev.get('detail') or '')}",
-            f"🕒 {ts(ev.get('ts'))}",
+            f"📤 旧 IP：<code>{esc(ev.get('old_ip'))}</code>",
+            f"🆔 已释放：<code>{esc(ev.get('allocation_id'))}</code>",
+            "",
+            "下一步：绑定新 IP 到实例",
         ]
     )
 
 
-def service_down_text(ev: dict[str, Any]) -> str:
-    """国内外都不通：服务/安全组问题，不是墙。"""
-    lines = [
-        "⚫ <b>服务不可用（不是被墙）</b>",
-        "",
-        f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
-        f"📤 IP：<code>{esc(ev.get('ip'))}</code>",
-        f"🔎 {esc(ev.get('detail') or '')}",
-    ]
-    if ev.get("matrix"):
-        lines.append(str(ev["matrix"]))
-    lines.append(
-        "💡 这个端口国内外都连不上，换 IP 解决不了。依次检查："
-        "① 服务进程在监听吗（ss -lntp）② 阿里云安全组放行了吗 "
-        "③ 系统防火墙（firewalld/ufw/iptables）④ 云盾/黑洞"
+def bound_text(ev: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "✅ <b>新 IP 已绑定到实例</b>",
+            "",
+            f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
+            f"📥 新 IP：<code>{esc(ev.get('new_ip'))}</code>",
+            f"🖥 实例：<code>{esc(ev.get('instance_id'))}</code>",
+            "",
+            "下一步：更新 Cloudflare 解析",
+        ]
     )
-    lines.append(f"🕒 {ts(ev.get('ts'))}")
-    return "\n".join(lines)
 
 
 def dns_text(ev: dict[str, Any]) -> str:
     dns = ev.get("dns") or []
     ok = sum(1 for d in dns if d.get("ok") == "1")
     lines = [
-        f"🌐 <b>DNS 同步</b> {'（手动）' if ev.get('manual') else ''}".strip(),
+        f"✅ <b>Cloudflare 解析已更新</b>（{ok}/{len(dns)}）",
         "",
         f"🎯 目标：<code>{esc(ev.get('target'))}</code>",
-        f"📥 IP：<code>{esc(ev.get('ip'))}</code>",
-        f"结果：{ok}/{len(dns)} 成功",
+        f"📥 指向：<code>{esc(ev.get('new_ip') or ev.get('ip'))}</code>",
+        "",
     ]
     for d in dns:
         mark = "✓" if d.get("ok") == "1" else "✗"
-        lines.append(f"   {mark} <code>{esc(d.get('name'))}</code> {esc(d.get('detail') or '')}")
+        detail = d.get("detail") or ""
+        name = d.get("name") or ""
+        if detail.startswith(name):
+            detail = detail[len(name):].lstrip(" →")
+        lines.append(f"  {mark} <code>{esc(name)}</code> {esc(detail)}")
+    if ok < len(dns):
+        lines.append("")
+        lines.append("⚠️ 有记录没更新成功，检查域名是否在同一个 zone、Token 是否有权限")
+    return "\n".join(lines)
+
+
+def success_text(ev: dict[str, Any]) -> str:
+    lines = [
+        "🎉 <b>换 IP 全部完成</b>",
+        "",
+        f"🎯 目标：<code>{esc(ev.get('target'))}</code>"
+        + (f" · 账号 {esc(ev['account'])}" if ev.get("account") else ""),
+        f"📤 旧 IP：<code>{esc(ev.get('old_ip') or '-')}</code>"
+        + ("（已释放）" if ev.get("old_released") else "（未释放，仍在计费）"),
+        f"📥 新 IP：<code>{esc(ev.get('new_ip') or '-')}</code>",
+    ]
+    dns = ev.get("dns") or []
+    if dns:
+        ok = sum(1 for d in dns if d.get("ok") == "1")
+        lines.append(f"🌐 解析：{ok}/{len(dns)} 条已指向新 IP")
+        for d in dns:
+            mark = "✓" if d.get("ok") == "1" else "✗"
+            lines.append(f"   {mark} <code>{esc(d.get('name'))}</code>")
+    elapsed = ev.get("elapsed")
+    if elapsed:
+        lines.append(f"⏱ 耗时 {elapsed:.1f}s")
+    lines.append(f"🕒 {ts(ev.get('ts'))}")
+    link = pingpe_line(ev.get("new_ip") or "", 443)
+    if link:
+        lines.append(link)
+    return "\n".join(lines)
+
+
+def failed_text(ev: dict[str, Any]) -> str:
+    lines = [
+        "❌ <b>换 IP 失败</b>",
+        "",
+        f"🎯 目标：<code>{esc(ev.get('target'))}</code>"
+        + (f" · 账号 {esc(ev['account'])}" if ev.get("account") else ""),
+    ]
+    if ev.get("old_ip"):
+        lines.append(f"📤 旧 IP：<code>{esc(ev['old_ip'])}</code>"
+                     + ("（已释放）" if ev.get("old_released") else ""))
+    if ev.get("new_ip"):
+        lines.append(f"📥 新 IP：<code>{esc(ev['new_ip'])}</code>")
+    lines.append(f"💥 原因：{esc(ev.get('error') or '未知')}")
+    steps = ev.get("steps") or []
+    if steps:
+        lines.append("")
+        lines.append("<b>过程</b>")
+        for step in steps[-10:]:
+            lines.append(f"· {esc(step)}")
     lines.append(f"🕒 {ts(ev.get('ts'))}")
     return "\n".join(lines)
 
 
-def settings_text(
-    settings: Any,
-    auto_states: dict[str, bool],
-    auto_switch_on: list[str] | None = None,
-) -> str:
+# ---------------------------------------------------------------- 查看
+def target_detail(name: str, detail: dict[str, Any], records: list[dict[str, str]] | None = None) -> str:
+    target = detail["target"]
+    eip = detail.get("eip")
     lines = [
-        "⚙️ <b>当前设置</b>",
-        "",
-        f"自动换 IP：{'✅ 开' if settings.auto else '⛔ 关'}",
-        f"检查间隔：{settings.interval}s",
-        f"触发阈值：连续 {settings.failure_threshold} 次",
-        f"冷却时间：{settings.cooldown}s",
-        f"成功后释放旧 EIP：{'是' if settings.release_old else '否'}",
-        f"频道通知：{'开' if settings.notify_channel else '关'}",
+        f"🎯 <b>{esc(name)}</b>" + (f" · {esc(target.notes)}" if target.notes else ""),
+        f"  账号 <code>{esc(target.account)}</code> · 实例 <code>{esc(target.instance_id)}</code>",
     ]
-    if auto_switch_on:
-        labels = ", ".join(VERDICT_LABELS.get(Verdict(v), v) for v in auto_switch_on)
-        lines.append(f"自动换 IP 的判定类型：{labels}")
-    if auto_states:
+    if eip:
+        lines.append(f"  IP <code>{esc(eip.ip)}</code>" + (f" → {esc(eip.instance_id)}" if eip.instance_id else " （未绑定）"))
+        lines.append(f"  EIP <code>{esc(eip.allocation_id)}</code> · {esc(eip.status or '?')}")
+    elif detail.get("error"):
+        lines.append(f"  ⚠️ {esc(detail['error'])}")
+    if target.dns_records:
+        lines.append(f"  🌐 {esc(', '.join(target.dns_records))}")
+    if records:
         lines.append("")
-        lines.append("<b>目标开关</b>")
-        for name, on in auto_states.items():
-            lines.append(f"  {name}: {'开' if on else '关'}")
-    lines.append("")
-    lines.append("命令：/set interval 60 · /set threshold 3 · /set cooldown 900 · /set release on|off")
-    lines.append("判定说明：/verdict")
+        lines.append("<b>当前解析</b>")
+        for rec in records:
+            lines.append(f"  {esc(rec['name'])} → <code>{esc(rec['content'])}</code>")
+    if eip and target.dns_records:
+        lines.append("")
+        lines.append(pingpe_line(eip.ip, 443, target.dns_records[0]))
     return "\n".join(lines)
 
 
-def matrix_text(probe: ProbeOutcome | None) -> str:
-    """告警里附带的国内外端口对照（纯文本，正则可读）。"""
-    text = port_matrix(probe)
-    if not text:
-        return ""
-    return text.replace("<b>", "").replace("</b>", "")
+def overview_text(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "还没有配置实例。用 /target add 添加，或直接改 config.yaml。"
+    lines = ["<b>当前实例</b>", ""]
+    for row in rows:
+        target = row["target"]
+        eip = row.get("eip")
+        if eip:
+            ip = f"<code>{esc(eip.ip)}</code>"
+            state = esc(eip.status or "?")
+        else:
+            ip = "—"
+            state = "查询失败" if row.get("error") else "无 EIP"
+        dns = len(target.dns_records)
+        lines.append(f"• <b>{esc(target.name)}</b> [{esc(target.account)}] {ip} · {state} · {dns} 条域名")
+    lines.append("")
+    lines.append("换 IP：/switch 目标名　详情：/status 目标名")
+    return "\n".join(lines)
 
 
-def pingpe_line(target: Any, ip: str = "") -> str:
-    """给 /probe /status 附上 ping.pe 自查链接（人工复核）。"""
-    if not ip:
-        return ""
-    port = getattr(target, "probe_port", 0) or 443
-    host = f"{ip}:{port}"
-    url = f"https://ping.pe/{host}"
-    if getattr(target, "dns_records", None):
-        url += f"?host={target.dns_records[0]}"
-    return f"🔗 人工复核（ping.pe）：{esc(url)}"
+def accounts_text(accounts: list[Any], counts: dict[str, int]) -> str:
+    if not accounts:
+        return "还没有阿里云账号。用 /account add 添加。"
+    lines = ["<b>阿里云账号</b>", ""]
+    for acc in accounts:
+        n = counts.get(acc.name, 0)
+        lines.append(f"• <b>{esc(acc.name)}</b> · <code>{esc(acc.access_key_id[:8])}…</code> · {esc(acc.region)} · {n} 台实例")
+    lines.append("")
+    lines.append("添加：/account add　删除：/account del 名字　改地域：/account region 名字 cn-hongkong")
+    return "\n".join(lines)
+
+
+def settings_text(cfg: Any) -> str:
+    cf = cfg.cloudflare
+    lines = [
+        "⚙️ <b>设置</b>",
+        "",
+        f"实测后释放旧 IP：{'✅ 是' if cfg.switch.release_old else '⛔ 否（会继续计费）'}",
+        f"分配重试次数：{cfg.switch.max_attempts}",
+        f"Cloudflare 域名：<code>{esc(cf.zone_name or cf.zone_id or '未设置')}</code>",
+        f"CF 代理（小黄云）：{'开' if cf.proxied else '关'}",
+        f"解析 TTL：{cf.ttl}s",
+        f"频道通知：<code>{cfg.channel_id or '未设置'}</code>",
+        f"管理员：{len(cfg.admin_chat_ids)} 人",
+        f"阿里云账号：{len(cfg.accounts)} 个 · 实例：{len(cfg.targets)} 台",
+    ]
+    lines.append("")
+    lines.append("改设置：/set release on|off · /set ttl 60 · /set proxied on|off")
+    return "\n".join(lines)
+
+
+def help_text() -> str:
+    return """<b>EIP Guard</b> · 阿里云 EIP 手动换 IP + Cloudflare 解析
+
+<b>换 IP（手动）</b>
+/switch 目标名 — 换 IP：释放旧 IP → 绑定新 IP → 改解析
+/switch all — 全部实例依次换
+/dns 目标名 [ip] — 只重同步解析
+
+<b>查看</b>
+/status — 全部实例和当前 IP
+/status 目标名 — 单个详情 + 当前解析
+/accounts — 阿里云账号列表
+/targets — 实例列表
+/settings — 当前设置
+/history — 最近操作记录
+
+<b>管理（也可后期在 SSH 里改 config.yaml）</b>
+/account add 名字 AK SK [地域]
+/account del 名字
+/account region 名字 地域
+/target add 名字 账号 实例ID [域名...]
+/target del 名字
+/target dns 名字 域名1 域名2
+/cf TOKEN 域名 — 设置 Cloudflare
+/set release on|off — 换完是否释放旧 IP
+/set proxied on|off — CF 小黄云
+/channel -100xxx — 通知频道
+/bind 口令 — 绑定自己为管理员
+/health — 依赖自检
+
+<b>说明</b>：不自动检测、不自动换。你发现被墙后手动发 /switch。
+每一步（释放成功、拿到新 IP、解析成功）都会推送到你和频道。
+"""
+
+
+def help_short() -> str:
+    return (
+        "<b>常用命令</b>\n"
+        "/status — 看 IP\n"
+        "/switch 目标名 — 换 IP\n"
+        "/accounts — 账号\n"
+        "/targets — 实例\n"
+        "/settings — 设置\n"
+        "/help — 全部命令"
+    )

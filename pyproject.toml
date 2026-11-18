@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "eipguard"
 version = "1.0.0"
-description = "阿里云 EIP 被墙自动更换 + Cloudflare 域名解析同步 + Telegram 机器人"
+description = "阿里云 EIP 手动换 IP + Cloudflare 解析同步 + Telegram 机器人（多账号）"
 requires-python = ">=3.10"
 dependencies = [
   "python-telegram-bot[socks]>=21.6,<23",

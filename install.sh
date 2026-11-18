@@ -1,36 +1,25 @@
 #!/usr/bin/env bash
 #
-#  EIP Guard 一键安装 / 管理脚本
+#  EIP Guard · 阿里云 EIP 手动换 IP + Cloudflare 解析 + Telegram 机器人
 #
-#  主程序（推荐，跑在一台长期在线的机器上）：
-#      bash <(curl -Ls https://raw.githubusercontent.com/USER/eip-guard/main/install.sh)
+#  安装（交互，推荐）：
+#      bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)
 #
-#  探针（国内、国外各跑一次，直接用对应机器的命令行）：
-#      bash <(curl -Ls .../install.sh) --probe --zone cn
-#      bash <(curl -Ls .../install.sh) --probe --zone overseas
-#
-#  非交互（CI / 批量部署）：
-#      TG_BOT_TOKEN=... ALIYUN_AK_ID=... ./install.sh --install --non-interactive
-#
-#  环境变量可覆盖：REPO BRANCH APP_DIR PIP_INDEX TG_BOT_TOKEN ...
+#  装完可以在 Telegram 里做剩下的配置（加账号、加实例、设 CF），
+#  也可以随时在这台机器上用命令行补：
+#      eipguard account add main AK SK cn-hongkong
+#      eipguard target add hk main i-xxxx hk.example.com
+#      eipguard cf TOKEN example.com
+#      eipguard bind 你的chatid
 #
 set -o pipefail
 
-# =====================================================================
-# 可修改的默认值
-# =====================================================================
-# ★ 源码仓库（已填好，换仓库时改这里）★
 REPO="${REPO:-kingsnakerrr/eip-guard}"
 BRANCH="${BRANCH:-main}"
 APP_DIR="${APP_DIR:-/opt/eipguard}"
-PROBE_DIR="${PROBE_DIR:-/opt/eip-probe}"
-SERVICE_MAIN="eipguard"
-SERVICE_PROBE="eip-probe"
-PIP_INDEX="${PIP_INDEX:-}"                  # 例：https://pypi.tuna.tsinghua.edu.cn/simple
+SERVICE="eipguard"
+PIP_INDEX="${PIP_INDEX:-}"
 
-# =====================================================================
-# 颜色 / 输出
-# =====================================================================
 if [ -t 1 ]; then
   RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; BLU=$'\033[36m'
   BLD=$'\033[1m'; DIM=$'\033[2m'; RST=$'\033[0m'
@@ -45,23 +34,17 @@ warn() { printf '%s!%s %s\n' "$YEL" "$RST" "$*"; }
 err()  { printf '%s✗%s %s\n' "$RED" "$RST" "$*" >&2; }
 dim()  { printf '%s%s%s\n' "$DIM" "$*" "$RST"; }
 die()  { err "$*"; exit 1; }
+hr()   { printf '%s\n' "────────────────────────────────────────────────────────"; }
+title(){ hr; printf '%s%s%s\n' "$BLD" "$*" "$RST"; hr; }
 
-hr() { printf '%s\n' "────────────────────────────────────────────────────────"; }
-title() { hr; printf '%s%s%s\n' "$BLD" "$*" "$RST"; hr; }
-
-# =====================================================================
-# 交互（支持 bash <(curl ...)，stdin 不一定是终端）
-# =====================================================================
 TTY=""
 for cand in /dev/tty /dev/stdin; do
   [ -r "$cand" ] && { TTY="$cand"; break; }
 done
 
-ask() {  # ask <提示> [默认值]
+ask() {
   local prompt="$1" def="${2:-}" ans=""
-  if [ "$NON_INTERACTIVE" = "1" ] || [ -z "$TTY" ]; then
-    printf '%s' "$def"; return
-  fi
+  if [ "$NON_INTERACTIVE" = "1" ] || [ -z "$TTY" ]; then printf '%s' "$def"; return; fi
   if [ -n "$def" ]; then
     printf '%s%s%s [%s%s%s]: ' "$BLD" "$prompt" "$RST" "$GRN" "$def" "$RST" >&2
   else
@@ -72,12 +55,9 @@ ask() {  # ask <提示> [默认值]
   printf '%s' "$ans"
 }
 
-ask_secret() {  # 不回显
+ask_secret() {
   local prompt="$1" ans=""
-  if [ "$NON_INTERACTIVE" = "1" ] || [ -z "$TTY" ]; then
-    printf ''
-    return
-  fi
+  if [ "$NON_INTERACTIVE" = "1" ] || [ -z "$TTY" ]; then printf ''; return; fi
   printf '%s%s%s: ' "$BLD" "$prompt" "$RST" >&2
   if command -v stty >/dev/null && [ -t 0 ] 2>/dev/null; then
     stty -echo <"$TTY" 2>/dev/null || true
@@ -90,7 +70,7 @@ ask_secret() {  # 不回显
   printf '%s' "$ans"
 }
 
-confirm() {  # confirm <提示> [默认 y/n]
+confirm() {
   local prompt="$1" def="${2:-n}" ans=""
   [ "$NON_INTERACTIVE" = "1" ] && { [ "$def" = "y" ]; return; }
   [ -z "$TTY" ] && { [ "$def" = "y" ]; return; }
@@ -98,13 +78,10 @@ confirm() {  # confirm <提示> [默认 y/n]
   printf '%s%s%s %s ' "$BLD" "$prompt" "$RST" "$hint" >&2
   IFS= read -r ans <"$TTY" || ans=""
   [ -z "$ans" ] && ans="$def"
-  case "$ans" in y|Y|yes|YES|是) return 0 ;; *) return 1 ;; esac
+  case "$ans" in y|Y|yes|是) return 0 ;; *) return 1 ;; esac
 }
 
-# =====================================================================
-# 系统
-# =====================================================================
-need_root() { [ "$(id -u)" -eq 0 ] || die "需要 root：请用 sudo 运行"; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "需要 root：sudo 再运行"; }
 
 detect_pm() {
   if command -v apt-get >/dev/null; then echo apt
@@ -134,57 +111,35 @@ PY
 }
 
 ensure_python() {
-  if py_ok; then
-    ok "Python $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
-    return 0
-  fi
+  if py_ok; then ok "Python $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"; return 0; fi
   warn "Python 3.10+ 缺失，尝试安装"
   pm_install python3 python3-venv python3-pip || true
-  if ! py_ok; then
-    for v in 3.13 3.12 3.11 3.10; do
-      if command -v "python$v" >/dev/null; then
-        ln -sf "$(command -v python$v)" /usr/local/bin/python3
-        break
-      fi
-    done
-  fi
-  py_ok || die "需要 Python 3.10+。Debian/Ubuntu 请先 apt install python3.11 python3.11-venv"
+  py_ok || die "需要 Python 3.10+"
   ok "Python $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
 }
 
-ensure_venv_support() {
+ensure_venv() {
   python3 -m venv "$1" 2>/dev/null && { rm -rf "$1"; return 0; }
   warn "python3-venv 缺失，安装"
   pm_install python3-venv python3-pip || true
   python3 -m venv "$1" 2>/dev/null && { rm -rf "$1"; return 0; }
-  die "无法创建虚拟环境，请安装 python3-venv"
-}
-
-ensure_ping() {
-  command -v ping >/dev/null && return 0
-  pm_install iputils-ping >/dev/null 2>&1 || pm_install iputils >/dev/null 2>&1 || true
+  die "无法创建虚拟环境"
 }
 
 has_systemd() { command -v systemctl >/dev/null && [ -d /run/systemd/system ]; }
 
-# =====================================================================
-# 源码获取：本地目录优先，否则从 GitHub 下载
-# =====================================================================
 SRC_TMP=""
-
 cleanup() { [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"; }
 trap cleanup EXIT
 
 local_source() {
   local self="${BASH_SOURCE[0]}"
-  # bash <(curl ...) 时路径是 /dev/fd/63，不能用
   case "$self" in /dev/*|/proc/*) return 1 ;; esac
   local d; d="$(cd "$(dirname "$self")" 2>/dev/null && pwd)" || return 1
   [ -f "$d/src/eipguard/__init__.py" ] || return 1
   printf '%s' "$d"
 }
 
-# 注意：本函数只把"路径"写到 stdout，所有日志必须去 stderr
 fetch_source() {
   local dir
   if dir="$(local_source)"; then
@@ -194,106 +149,39 @@ fetch_source() {
   fi
 
   SRC_TMP="$(mktemp -d)"
-  local out="$SRC_TMP/src.tgz"
-  local ok=0
-
-  # 多个镜像依次尝试；国内直连 github.com 常被重置（HTTP/2 stream 中断）
+  local out="$SRC_TMP/src.tgz" ok=0 url
   local -a urls=(
     "https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
     "https://ghproxy.net/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
     "https://gh-proxy.com/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
     "https://ghfast.top/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
-    "https://ghproxy.cc/https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz"
   )
-
   for url in "${urls[@]}"; do
     info "下载源码：${url}" >&2
     rm -f "$out"
-    # --http1.1 规避 HTTP/2 stream 中断；--retry 覆盖偶发断流
-    if curl -fsSL --http1.1 \
-         --connect-timeout 15 --max-time 300 \
-         --retry 3 --retry-delay 2 --retry-all-errors \
-         "$url" -o "$out" 2>/dev/null; then
-      if tar tzf "$out" >/dev/null 2>&1; then
-        ok=1
-        break
-      fi
-      warn "下载到的不是有效压缩包，换下一个镜像" >&2
+    if curl -fsSL --http1.1 --connect-timeout 15 --max-time 300 \
+         --retry 2 --retry-delay 2 --retry-all-errors "$url" -o "$out" 2>/dev/null; then
+      if tar tzf "$out" >/dev/null 2>&1; then ok=1; break; fi
+      warn "压缩包损坏，换下一个镜像" >&2
     fi
   done
-
   if [ "$ok" != "1" ]; then
-    err "所有下载地址都失败（网络问题）" >&2
+    err "下载失败（网络问题）" >&2
     {
       msg ""
-      msg "当前 REPO = ${BLD}${REPO}${RST}"
-      msg ""
-      msg "常见原因：这台机器连 GitHub 被重置（curl: (18)/(35)/(56)）。"
-      msg ""
-      msg "三个办法，任选其一："
-      msg "  ${BLD}1)${RST} 直接在 GitHub 网页下载压缩包，上传到这台机器后本地安装："
+      msg "办法："
+      msg "  1) 浏览器下载后上传到本机，解压后运行 ./install.sh"
       msg "     ${DIM}https://github.com/${REPO}/archive/refs/heads/${BRANCH}.tar.gz${RST}"
-      msg "     ${DIM}tar xzf ${BRANCH}.tar.gz && cd eip-guard-${BRANCH} && sudo ./install.sh --probe --zone cn --token xxx${RST}"
-      msg ""
-      msg "  ${BLD}2)${RST} 用代理下载（有 clash 等代理时）："
-      msg "     ${DIM}export https_proxy=http://127.0.0.1:7890${RST}"
-      msg "     ${DIM}bash <(curl -Ls .../install.sh) --probe --zone cn --token xxx${RST}"
-      msg ""
-      msg "  ${BLD}3)${RST} 手动 git clone 后本地安装："
-      msg "     ${DIM}git clone https://github.com/${REPO}.git && cd eip-guard && sudo ./install.sh --probe --zone cn${RST}"
-      msg ""
-      msg "注意：本地目录安装会自动使用当前目录的源码，不再联网。"
+      msg "  2) 有代理时：${DIM}export https_proxy=http://127.0.0.1:7890${RST}"
+      msg "  3) git clone https://github.com/${REPO}.git && cd eip-guard && sudo ./install.sh"
     } >&2
     return 1
   fi
-
   tar xzf "$out" -C "$SRC_TMP" || die "解压失败"
   local root
   root="$(find "$SRC_TMP" -maxdepth 1 -type d -name '*-*' | head -1)"
   [ -n "$root" ] || die "压缩包结构异常"
   printf '%s' "$root"
-}
-
-# =====================================================================
-# 服务管理
-# =====================================================================
-svc_write() {  # svc_write <名称> <目录> <启动命令> <用户> [额外环境行]
-  local name="$1" dir="$2" exec_cmd="$3" user="$4" extra="${5:-}"
-  local file="/etc/systemd/system/${name}.service"
-  local user_lines=""
-  [ -n "$user" ] && [ "$user" != "root" ] && user_lines="User=${user}
-Group=${user}"
-  cat >"$file" <<UNIT
-[Unit]
-Description=${name} (EIP Guard)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${dir}
-${user_lines}
-${extra}
-ExecStart=${exec_cmd}
-Restart=always
-RestartSec=5
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  systemctl daemon-reload
-  systemctl enable "$name" >/dev/null 2>&1 || true
-}
-
-svc_start() { systemctl restart "$1" && ok "$1 已启动" || err "$1 启动失败，看日志：journalctl -u $1 -n 50"; }
-
-svc_stop_rm() {
-  local name="$1"
-  systemctl stop "$name" >/dev/null 2>&1 || true
-  systemctl disable "$name" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/${name}.service"
-  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 svc_state() {
@@ -304,286 +192,108 @@ svc_state() {
   else echo "${DIM}未安装${RST}"; fi
 }
 
-# =====================================================================
-# 配置文件生成（交互向导）
-# =====================================================================
-yaml_q() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+svc_start() { systemctl restart "$1" && ok "$1 已启动" || err "$1 启动失败：journalctl -u $1 -n 50"; }
 
-gen_env_and_config() {
+# =====================================================================
+# 写配置：最小可用（token + 管理员），其余留给 TG
+# =====================================================================
+write_config() {
   local dir="$1"
   local env_file="$dir/.env" cfg_file="$dir/config.yaml"
-  local fresh=0
-  [ -f "$env_file" ] || fresh=1
 
-  if [ "$fresh" = "1" ]; then
-    title "配置向导（共 5 组，直接回车用默认值）"
+  if [ -f "$cfg_file" ]; then
+    info "保留已有 config.yaml"
+    return 0
+  fi
 
-    # ---------- Telegram ----------
-    msg ""
-    msg "${BLD}① Telegram${RST} (${DIM}找 @BotFather 发 /newbot 拿 token${RST})"
-    local tg_token="${TG_BOT_TOKEN:-}"
-    [ -z "$tg_token" ] && tg_token="$(ask 'Bot Token' '')"
-    [ -z "$tg_token" ] && die "Bot Token 不能为空（也可用环境变量 TG_BOT_TOKEN）"
-    local tg_admins="${TG_ADMIN_IDS:-}"
-    [ -z "$tg_admins" ] && tg_admins="$(ask '你的数字 chat id（可空，之后私聊机器人 /bind）' '')"
-    local tg_channel="${TG_CHANNEL_ID:-}"
-    [ -z "$tg_channel" ] && tg_channel="$(ask '通知频道 id（可空，形如 -1001234567890）' '')"
-    local tg_bind="${TG_BIND_TOKEN:-}"
-    [ -z "$tg_bind" ] && tg_bind="$(ask '首次绑定口令（可空）' '')"
-    local tg_proxy="${TG_PROXY:-}"
-    if [ -z "$tg_proxy" ]; then
-      msg "${DIM}   如果这台机器连不上 Telegram（国内机器常见），填个代理${RST}"
-      tg_proxy="$(ask 'Telegram 代理（可空，如 socks5://127.0.0.1:1080）' '')"
-    fi
+  title "基础配置（共 3 项，其余之后在 Telegram 里加）"
 
-    # ---------- 阿里云 ----------
-    msg ""
-    msg "${BLD}② 阿里云${RST} (${DIM}每个账号建一个 RAM 子账号，只给 EIP 权限${RST})"
-    local ak1="${ALIYUN_AK_ID:-}" sk1="${ALIYUN_AK_SECRET:-}"
-    [ -z "$ak1" ] && ak1="$(ask '账号 1 AccessKey ID' '')"
-    [ -z "$sk1" ] && sk1="$(ask_secret '账号 1 AccessKey Secret')"
-    [ -z "$ak1" ] || [ -z "$sk1" ] && die "账号 1 的 AK/SK 不能为空"
-    local region1="${ALIYUN_REGION:-}"
-    [ -z "$region1" ] && region1="$(ask '账号 1 默认地域' 'cn-hongkong')"
-    local name1="${ALIYUN_NAME:-}"
-    [ -z "$name1" ] && name1="$(ask '账号 1 代号（脚本内部用）' 'main')"
+  msg ""
+  msg "${BLD}① Telegram Bot${RST} ${DIM}（@BotFather 发 /newbot）${RST}"
+  local tg_token="${TG_BOT_TOKEN:-}"
+  [ -z "$tg_token" ] && tg_token="$(ask 'Bot Token' '')"
+  [ -z "$tg_token" ] && die "Bot Token 必填（或用环境变量 TG_BOT_TOKEN）"
 
-    local ak2="${ALIYUN_AK_ID_2:-}" sk2="${ALIYUN_AK_SECRET_2:-}" region2="${ALIYUN_REGION_2:-cn-hongkong}" name2="second"
-    if [ -n "$ak2" ] || confirm '添加第二个阿里云账号？' n; then
-      [ -z "$ak2" ] && ak2="$(ask '账号 2 AccessKey ID' '')"
-      [ -z "$sk2" ] && sk2="$(ask_secret '账号 2 AccessKey Secret')"
-      [ -z "$region2" ] && region2="$(ask '账号 2 默认地域' 'cn-hongkong')"
-      name2="$(ask '账号 2 代号' 'second')"
-    fi
+  local tg_admin="${TG_ADMIN_IDS:-}"
+  [ -z "$tg_admin" ] && tg_admin="$(ask '你的数字 chat id（可空，之后 /bind 口令）' '')"
 
-    # ---------- Cloudflare ----------
-    msg ""
-    msg "${BLD}③ Cloudflare${RST} (${DIM}Token 权限：Zone.DNS:Edit + Zone:Read${RST})"
-    local cf_token="${CF_API_TOKEN:-}"
-    [ -z "$cf_token" ] && cf_token="$(ask_secret 'Cloudflare API Token')"
-    [ -z "$cf_token" ] && die "Cloudflare Token 不能为空"
-    local cf_zone="${CF_ZONE_NAME:-}"
-    [ -z "$cf_zone" ] && cf_zone="$(ask '域名（zone）' 'example.com')"
+  msg ""
+  msg "${BLD}② 管理员口令${RST} ${DIM}（防止别人抢先绑定，可空）${RST}"
+  local bind_token="${TG_BIND_TOKEN:-}"
+  [ -z "$bind_token" ] && bind_token="$(ask '绑定口令' '')"
 
-    # ---------- 探针 ----------
-    msg ""
-    msg "${BLD}④ 探针${RST} (${DIM}必须国内 + 国外各一台，判定靠对比${RST})"
-    msg "${DIM}   还没装？先在另外两台机器上跑：${RST}"
-    msg "${DIM}   bash <(curl -Ls .../install.sh) --probe --zone cn${RST}"
-    msg "${DIM}   bash <(curl -Ls .../install.sh) --probe --zone overseas${RST}"
-    local probe_cn="${PROBE_CN_URL:-}"
-    [ -z "$probe_cn" ] && probe_cn="$(ask '国内探针地址（http://IP:8787）' '')"
-    local probe_os="${PROBE_OS_URL:-}"
-    [ -z "$probe_os" ] && probe_os="$(ask '国外探针地址（http://IP:8787）' '')"
-    local probe_token="${PROBE_AGENT_TOKEN:-}"
-    [ -z "$probe_token" ] && probe_token="$(ask '探针 token（两台一致）' '')"
-    if [ -z "$probe_cn" ] || [ -z "$probe_os" ]; then
-      warn "探针地址没填全，程序能启动但会一直「无法判定」。之后可改 $env_file"
-    fi
+  msg ""
+  msg "${BLD}③ Telegram 代理${RST} ${DIM}（服务器在国内才需要，国外直接回车）${RST}"
+  local tg_proxy="${TG_PROXY:-}"
+  [ -z "$tg_proxy" ] && tg_proxy="$(ask 'socks5://127.0.0.1:1080（可空）' '')"
 
-    # ---------- 实例 ----------
-    msg ""
-    msg "${BLD}⑤ 要换 IP 的实例${RST} (${DIM}控制台里的 i-xxxx，以及要跟着换的域名${RST})"
-    local inst_list=()
+  umask 077
+  {
+    echo "# 由 install.sh 生成 $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "TG_BOT_TOKEN=$tg_token"
+    echo "TG_ADMIN_IDS=$tg_admin"
+    echo "TG_BIND_TOKEN=$bind_token"
+    echo "TG_PROXY=$tg_proxy"
+  } >"$env_file"
+  chmod 600 "$env_file"
 
-    # 非交互模式：从 TARGETS 读，格式 name|account|instance|port|aux|dns，多条换行或分号
-    if [ "$NON_INTERACTIVE" = "1" ] && [ -n "${TARGETS:-}" ]; then
-      local record
-      while IFS= read -r record; do
-        record="$(printf '%s' "$record" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-        [ -z "$record" ] && continue
-        inst_list+=("$record")
-      done < <(printf '%s\n' "$TARGETS" | tr ';' '\n')
-    else
-      local i=0
-      while :; do
-        i=$((i+1))
-        local tname taccount tinst tport taux tdns
-        if [ -z "$TTY" ] && [ "$NON_INTERACTIVE" != "1" ]; then
-          die "没有交互终端。请用 --non-interactive 并设置 TARGETS 环境变量"
-        fi
-        tname="$(ask "实例 $i 代号" "")"
-        [ -z "$tname" ] && { [ "$i" -eq 1 ] && die "至少填一个实例"; break; }
-        taccount="$(ask "  用哪个账号代号" "$name1")"
-        tinst="$(ask "  实例 ID（i-xxxxxxxx）" "")"
-        [ -z "$tinst" ] && die "实例 ID 不能为空"
-        tport="$(ask "  业务端口" "443")"
-        taux="$(ask "  这台机器上其它真实开放的端口（空格分隔，用来区分整机/单端口）" "22 80")"
-        tdns="$(ask "  要跟随的域名（空格分隔）" "")"
-        inst_list+=("${tname}|${taccount}|${tinst}|${tport}|${taux}|${tdns}")
-        confirm '再添加一个实例？' n || break
-      done
-    fi
-    if [ "${#inst_list[@]}" -eq 0 ]; then
-      err "没有实例配置。"
-      msg ""
-      msg "非交互模式需要 TARGETS 环境变量，格式："
-      msg "  ${DIM}name|account|instance_id|port|aux_ports|dns_records${RST}"
-      msg ""
-      msg "示例："
-      msg "  ${DIM}TARGETS='hk-main|main|i-j6cxxx|443|22 80|hk.example.com api.example.com'${RST}"
-      msg "  ${DIM}TG_BOT_TOKEN=... ALIYUN_AK_ID=... bash install.sh --install --non-interactive${RST}"
-      die "已中止"
-    fi
-
-    # ---------- 写 .env ----------
-    umask 077
-    {
-      echo "# 由 install.sh 生成于 $(date '+%Y-%m-%d %H:%M:%S')"
-      echo "TG_BOT_TOKEN=$tg_token"
-      echo "TG_ADMIN_IDS=$tg_admins"
-      echo "TG_BIND_TOKEN=$tg_bind"
-      echo "TG_CHANNEL_ID=$tg_channel"
-      echo "TG_PROXY=$tg_proxy"
-      echo ""
-      echo "ALIYUN_AK_ID=$ak1"
-      echo "ALIYUN_AK_SECRET=$sk1"
-      echo "ALIYUN_AK_ID_2=$ak2"
-      echo "ALIYUN_AK_SECRET_2=$sk2"
-      echo ""
-      echo "CF_API_TOKEN=$cf_token"
-      echo ""
-      echo "PROBE_CN_URL=$probe_cn"
-      echo "PROBE_OS_URL=$probe_os"
-      echo "PROBE_AGENT_TOKEN=$probe_token"
-    } >"$env_file"
-    chmod 600 "$env_file"
-
-    # ---------- 写 config.yaml ----------
-    exec 3>"$cfg_file"
-    cat >&3 <<YAML
-# 由 install.sh 生成于 $(date '+%Y-%m-%d %H:%M:%S')
-# 改完执行：systemctl restart eipguard
+  cat >"$cfg_file" <<YAML
+# 由 install.sh 生成 $(date '+%Y-%m-%d %H:%M:%S')
+# 阿里云账号、Cloudflare、实例都可以之后在 Telegram 里添加：
+#   /account add  → 填 AK/SK/地域
+#   /cf           → 填 CF Token + 域名
+#   /target add   → 填实例 ID + 域名
+# 也可以在这台机器上用命令行：
+#   eipguard account add main AK SK cn-hongkong
+#   eipguard cf TOKEN example.com
+#   eipguard target add hk main i-xxxx hk.example.com
 
 telegram:
   token: "\${TG_BOT_TOKEN}"
   admin_chat_ids: "\${TG_ADMIN_IDS:-}"
   bind_token: "\${TG_BIND_TOKEN:-}"
-  channel_id: "\${TG_CHANNEL_ID:-}"
+  channel_id: ""
   proxy: "\${TG_PROXY:-}"
 
 aliyun:
-  accounts:
-    - name: $(yaml_q "$name1")
-      access_key_id: "\${ALIYUN_AK_ID}"
-      access_key_secret: "\${ALIYUN_AK_SECRET}"
-      default_region: $(yaml_q "$region1")
-YAML
-    if [ -n "$ak2" ]; then
-      cat >&3 <<YAML
-    - name: $(yaml_q "${name2:-second}")
-      access_key_id: "\${ALIYUN_AK_ID_2}"
-      access_key_secret: "\${ALIYUN_AK_SECRET_2}"
-      default_region: $(yaml_q "$region2")
-YAML
-    fi
-    cat >&3 <<'YAML'
-
-timezone: "Asia/Shanghai"
-data_dir: "./data"
-log_level: "INFO"
+  accounts: []
 
 cloudflare:
-  api_token: "${CF_API_TOKEN}"
-  zone_name: "PLACEHOLDER_ZONE"
+  api_token: ""
+  zone_name: ""
   ttl: 60
   proxied: false
   create_missing: true
-
-detect:
-  provider: "probe_agent"
-  port: 443
-  interval: 60
-  failure_threshold: 3
-  fail_ratio: 0.6
-  timeout: 6.0
-  attempts: 2
-  # icmp 只做参考展示，不参与判定；tls 用来查 SNI 阻断
-  layers: ["icmp", "tls"]
-  # 全局默认辅助端口，target 可覆盖
-  aux_ports: [22, 80]
-  http_path: "/"
-  verify_delay: 20
-  verify_attempts: 3
-  probe_agent:
-    agents:
-YAML
-    if [ -n "$probe_cn" ]; then
-      cat >&3 <<YAML
-      - url: "\${PROBE_CN_URL}"
-        token: "\${PROBE_AGENT_TOKEN}"
-        zone: "cn"
-        name: "cn-probe"
-YAML
-    fi
-    if [ -n "$probe_os" ]; then
-      cat >&3 <<YAML
-      - url: "\${PROBE_OS_URL}"
-        token: "\${PROBE_AGENT_TOKEN}"
-        zone: "overseas"
-        name: "os-probe"
-YAML
-    fi
-    cat >&3 <<'YAML'
-  checkhost:
-    max_nodes: 6
-    timeout: 20
+  multi_record_policy: replace
 
 switch:
-  auto: true
-  # 只有「IP 被墙」自动换；端口被墙/服务故障换 IP 无效
-  auto_switch_on: ["ip_blocked"]
-  max_attempts: 3
-  cooldown: 900
   release_old: true
-  restore_old_on_failure: true
+  max_attempts: 3
   internet_charge_type: ""
   bandwidth_mbps: null
   isp: ""
 
-targets:
+targets: []
+
+timezone: "Asia/Shanghai"
+data_dir: "./data"
+log_level: "INFO"
 YAML
-    for entry in "${inst_list[@]}"; do
-      IFS='|' read -r tname taccount tinst tport taux tdns <<<"$entry"
-      {
-        printf '  - name: %s\n' "$(yaml_q "$tname")"
-        printf '    account: %s\n' "$(yaml_q "$taccount")"
-        printf '    instance_id: %s\n' "$(yaml_q "$tinst")"
-        printf '    probe_port: %s\n' "$tport"
-        if [ -n "$taux" ]; then
-          printf '    aux_ports: [%s]\n' "$(printf '%s' "$taux" | tr ' ' ',')"
-        fi
-        if [ -n "$tdns" ]; then
-          printf '    dns_records:\n'
-          for d in $tdns; do printf '      - %s\n' "$(yaml_q "$d")"; done
-        fi
-        printf '    notes: ""\n'
-      } >&3
-    done
-    exec 3>&-
-
-    # 填 zone（避免 heredoc 转义问题）
-    sed -i "s|zone_name: \"PLACEHOLDER_ZONE\"|zone_name: \"${cf_zone}\"|" "$cfg_file"
-
-    chmod 640 "$cfg_file"
-    ok "已生成 $env_file 和 $cfg_file"
-  else
-    info "保留已有配置（$env_file）"
-  fi
+  chmod 600 "$cfg_file"
+  ok "已生成 $env_file 和 $cfg_file"
 }
 
 # =====================================================================
-# 主程序
+# 安装主程序
 # =====================================================================
 install_main() {
   need_root
-  title "安装 / 更新 EIP Guard 主程序"
+  title "安装 / 更新 EIP Guard"
 
-  has_systemd || warn "没有 systemd，将只安装文件，需手动启动"
+  has_systemd || warn "没有 systemd，只能手动运行"
 
   ensure_python
-  ensure_venv_support "$APP_DIR/.venv.$$"
-  ensure_ping
+  ensure_venv "$APP_DIR/.venv.$$"
 
   local src; src="$(fetch_source)" || die "获取源码失败"
 
@@ -594,9 +304,7 @@ install_main() {
   mkdir -p "$APP_DIR/data"
   rm -rf "$APP_DIR/src"
   cp -r "$src/src" "$src/pyproject.toml" "$src/requirements.txt" "$APP_DIR/"
-  [ -f "$APP_DIR/config.example.yaml" ] || cp "$src/config.example.yaml" "$APP_DIR/" 2>/dev/null || true
-  mkdir -p "$APP_DIR/probe_agent"
-  cp "$src/probe_agent/server.py" "$APP_DIR/probe_agent/" 2>/dev/null || true
+  [ -f "$APP_DIR/config.example.yaml" ] && cp "$src/config.example.yaml" "$APP_DIR/" || true
 
   if [ ! -d "$APP_DIR/.venv" ]; then
     python3 -m venv "$APP_DIR/.venv" || die "创建虚拟环境失败"
@@ -606,108 +314,45 @@ install_main() {
   info "安装依赖（首次约 1-2 分钟）"
   "$APP_DIR/.venv/bin/pip" install -q --upgrade pip "${mirror[@]}" >/dev/null 2>&1 || true
   "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt" "${mirror[@]}" \
-    || die "依赖安装失败（国内可加 --pip-index https://pypi.tuna.tsinghua.edu.cn/simple）"
-  "$APP_DIR/.venv/bin/pip" install -q --no-deps -e "$APP_DIR" || die "安装本体失败"
+    || die "依赖安装失败（可加 --pip-index https://pypi.tuna.tsinghua.edu.cn/simple）"
+  "$APP_DIR/.venv/bin/pip" install -q --no-deps -e "$APP_DIR" || die "安装失败"
 
-  gen_env_and_config "$APP_DIR"
+  write_config "$APP_DIR"
 
   if ! id eipguard >/dev/null 2>&1; then
     useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin eipguard 2>/dev/null || true
   fi
   chown -R eipguard:eipguard "$APP_DIR" 2>/dev/null || true
-  chmod 600 "$APP_DIR/.env"
-  chmod 640 "$APP_DIR/config.yaml"
+  chmod 600 "$APP_DIR/.env" "$APP_DIR/config.yaml"
   chmod 700 "$APP_DIR/data"
 
-  # 配置校验
   info "校验配置"
-  if ! ( cd "$APP_DIR" && set -a && . ./.env && set +a && \
-         "$APP_DIR/.venv/bin/python" -m eipguard -c "$APP_DIR/config.yaml" --check-config ); then
-    warn "配置校验未通过，请检查后手动启动"
-    [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
+  if ! ( cd "$APP_DIR" && "$APP_DIR/.venv/bin/python" -m eipguard -c config.yaml --check-config ); then
+    warn "配置校验未通过，修好后手动启动"
     return 1
   fi
 
-  if has_systemd; then
-    svc_write "$SERVICE_MAIN" "$APP_DIR" \
-      "$APP_DIR/.venv/bin/python -m eipguard -c $APP_DIR/config.yaml" "eipguard"
-    svc_start "$SERVICE_MAIN"
-  else
-    warn "手动启动：cd $APP_DIR && .venv/bin/python -m eipguard -c config.yaml"
-  fi
-
-  echo
-  ok "主程序已就绪${update:+（更新完成）}"
-  msg ""
-  msg "  状态：${BLD}eipguard status${RST}   |   日志：${BLD}eipguard log${RST}"
-  msg "  改配置：${BLD}${APP_DIR}/.env${RST} 和 ${BLD}${APP_DIR}/config.yaml${RST}"
-  msg "  首次使用：Telegram 私聊机器人发 ${BLD}/bind${RST} 或 ${BLD}/start${RST}"
-  [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
-  return 0
-}
-
-# =====================================================================
-# 探针
-# =====================================================================
-install_probe_client() {
-  # 家宽/NAT 用：探针主动连主程序，不需要公网 IP、不需要端口转发
-  local hub="${PROBE_HUB:-}" token="$PROBE_TOKEN" zone="$ZONE"
-
-  if [ -z "$token" ]; then
-    token="$(ask '探针 token（和主程序一致）' '')"
-  fi
-  [ -z "$token" ] && die "需要 token（主程序 .env 里的 PROBE_AGENT_TOKEN）"
-
-  if [ -z "$zone" ]; then
-    msg "这台机器在哪一侧？"
-    msg "  1) cn        国内（中国大陆）—— 家宽通常选这个"
-    msg "  2) overseas  国外（境外）"
-    local pick; pick="$(ask '选择' '1')"
-    case "$pick" in 2|overseas) zone="overseas" ;; *) zone="cn" ;; esac
-  fi
-  ZONE="$zone"
-
-  if [ -z "$hub" ]; then
-    msg ""
-    msg "${BLD}主程序地址${RST}：主程序那台机器的 IP + hub 端口（默认 8790）"
-    msg "${DIM}   例：ws://1.2.3.4:8790  （主程序在国外 VPS 上，填它的公网 IP）${RST}"
-    hub="$(ask '主程序 hub 地址' '')"
-  fi
-  [ -z "$hub" ] && die "需要主程序地址（例如 ws://1.2.3.4:8790）"
-  case "$hub" in ws://*|wss://*) ;; *) hub="ws://${hub}" ;; esac
-
-  ensure_python
-  ensure_ping
-
-  local src; src="$(fetch_source)" || die "获取源码失败"
-  info "部署到 $PROBE_DIR"
-  mkdir -p "$PROBE_DIR"
-  cp "$src/probe_agent/server.py" "$src/probe_agent/client.py" "$PROBE_DIR/"
-
-  if ! python3 -c 'import aiohttp' 2>/dev/null; then
-    info "安装 aiohttp"
-    if ! pm_install python3-aiohttp >/dev/null 2>&1 && \
-       ! python3 -m pip install -q aiohttp >/dev/null 2>&1; then
-      python3 -m pip install -q --break-system-packages aiohttp || die "aiohttp 安装失败"
-    fi
-  fi
-
-  printf 'PROBE_TOKEN=%s\nPROBE_HUB=%s\nZONE=%s\nPROBE_NAME=%s\n' \
-    "$token" "$hub" "$ZONE" "$(hostname)" >"$PROBE_DIR/agent.env"
-  chmod 600 "$PROBE_DIR/agent.env"
+  # 装命令行工具
+  cat >/usr/local/bin/eipguard <<SH
+#!/bin/sh
+exec $APP_DIR/.venv/bin/python -m eipguard -c $APP_DIR/config.yaml "\$@"
+SH
+  chmod +x /usr/local/bin/eipguard
 
   if has_systemd; then
-    cat >/etc/systemd/system/eip-probe-client.service <<UNIT
+    cat >/etc/systemd/system/${SERVICE}.service <<UNIT
 [Unit]
-Description=eip-probe-client (EIP Guard 反向探针)
+Description=EIP Guard (Aliyun EIP switch + Cloudflare + Telegram)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$PROBE_DIR
-EnvironmentFile=$PROBE_DIR/agent.env
-ExecStart=/usr/bin/python3 $PROBE_DIR/client.py --hub \${PROBE_HUB} --token \${PROBE_TOKEN} --zone \${ZONE} --name \${PROBE_NAME}
+WorkingDirectory=${APP_DIR}
+User=eipguard
+Group=eipguard
+EnvironmentFile=${APP_DIR}/.env
+ExecStart=${APP_DIR}/.venv/bin/python -m eipguard -c ${APP_DIR}/config.yaml
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -716,306 +361,59 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
-    systemctl enable eip-probe-client >/dev/null 2>&1 || true
-    svc_start eip-probe-client
-    sleep 3
-    if systemctl is-active --quiet eip-probe-client; then
-      if journalctl -u eip-probe-client -n 30 --no-pager -o cat 2>/dev/null | grep -q "已连接"; then
-        ok "已连上主程序（zone=$ZONE）"
-      else
-        warn "服务在跑，但还没确认连上。看日志：journalctl -u eip-probe-client -f"
-      fi
+    systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+    svc_start "$SERVICE"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE"; then
+      ok "服务运行中"
     else
       err "服务没起来："
-      journalctl -u eip-probe-client -n 20 --no-pager -o cat 2>/dev/null | tail -20
+      journalctl -u "$SERVICE" -n 20 --no-pager -o cat 2>/dev/null | tail -20
     fi
   else
-    warn "手动启动：cd $PROBE_DIR && PROBE_TOKEN=$token PROBE_HUB=$hub ZONE=$zone python3 client.py"
+    warn "手动启动：cd $APP_DIR && .venv/bin/python -m eipguard -c config.yaml"
   fi
 
   echo
-  ok "反向探针已就绪（zone=$ZONE）"
-  msg ""
-  msg "  它会主动连 ${hub}，不需要公网 IP、不用开端口。"
-  dim "主程序 config.yaml 里需要："
-  dim "  detect:"
-  dim "    hub: {enabled: true, port: 8790, token: \"${token}\"}"
-  msg ""
-  dim "日志：journalctl -u eip-probe-client -f"
-}
-
-install_probe() {
-  need_root
-  title "安装 / 更新 EIP Guard 探针"
-
-  # 反向模式：机器没有公网 IP（家宽/NAT），主动连主程序
-  if [ "$PROBE_MODE" = "client" ]; then
-    install_probe_client
-    return $?
-  fi
-
-  local zone="$ZONE"
-  if [ -z "$zone" ]; then
-    msg "这台机器在哪一侧？判定靠「国内不通 + 国外通」对比，两侧都要有。"
-    msg "  1) cn        国内（中国大陆）"
-    msg "  2) overseas  国外（境外）"
-    local pick; pick="$(ask '选择' '2')"
-    case "$pick" in 1|cn|CN|国内) zone="cn" ;; *) zone="overseas" ;; esac
-  fi
-  case "$zone" in cn|overseas) ;; *) die "--zone 只能是 cn 或 overseas" ;; esac
-  ZONE="$zone"
-
-  ensure_python
-  ensure_ping
-
-  local token="$PROBE_TOKEN"
-  if [ -z "$token" ]; then
-    token="$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    info "生成探针 token（两台必须一致）：${BLD}${token}${RST}"
-  fi
-
-  local src; src="$(fetch_source)" || die "获取源码失败"
-
-  info "部署到 $PROBE_DIR"
-  mkdir -p "$PROBE_DIR"
-  cp "$src/probe_agent/server.py" "$PROBE_DIR/"
-  cp "$src/probe_agent/client.py" "$PROBE_DIR/" 2>/dev/null || true
-
-  # 依赖：优先系统包 aiohttp
-  if ! python3 -c 'import aiohttp' 2>/dev/null; then
-    info "安装 aiohttp"
-    if ! pm_install python3-aiohttp >/dev/null 2>&1 && \
-       ! python3 -m pip install -q aiohttp >/dev/null 2>&1; then
-      python3 -m pip install -q --break-system-packages aiohttp || die "aiohttp 安装失败"
-    fi
-  fi
-
-  printf 'PROBE_TOKEN=%s\nPROBE_PORT=%s\nZONE=%s\n' "$token" "$PROBE_PORT" "$ZONE" >"$PROBE_DIR/probe.env"
-  chmod 600 "$PROBE_DIR/probe.env"
-
-  if has_systemd; then
-    svc_write "$SERVICE_PROBE" "$PROBE_DIR" \
-      "/usr/bin/python3 $PROBE_DIR/server.py --port $PROBE_PORT" "" \
-      "EnvironmentFile=$PROBE_DIR/probe.env"
-    if ! port_free "$PROBE_PORT"; then
-      warn "端口 $PROBE_PORT 已被占用（可能是别的程序），探针可能起不来"
-    fi
-    svc_start "$SERVICE_PROBE"
-    sleep 2
-    if ! systemctl is-active --quiet "$SERVICE_PROBE"; then
-      err "服务没起来，日志如下："
-      journalctl -u "$SERVICE_PROBE" -n 20 --no-pager -o cat 2>/dev/null | tail -20
-    elif probe_healthy; then
-      ok "健康检查通过（zone=$ZONE）"
-    else
-      warn "端口 $PROBE_PORT 有响应但不是本探针，检查是否被占用：ss -lntp | grep $PROBE_PORT"
-    fi
-  else
-    warn "手动启动：cd $PROBE_DIR && PROBE_TOKEN=$token ZONE=$zone python3 server.py --port $PROBE_PORT"
-  fi
-
-  ensure_firewall "$PROBE_PORT"
-
-  local pub lan
-  pub="$(curl -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
-  lan="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
-  [ -z "$lan" ] && lan="$(hostname -I 2>/dev/null | awk '{print $1}')"
-
+  ok "安装完成${update:+（这是更新，配置已保留）}"
   echo
-  ok "探针已就绪（zone=${ZONE}）"
+  msg "  ${BLD}下一步（任选其一）${RST}"
   msg ""
-  msg "  token：${BLD}${token}${RST}"
+  msg "  ${BLD}方式 A：在 Telegram 里配置${RST}"
+  msg "    1. 私聊机器人发 /start"
+  msg "    2. /account add  → 填阿里云 AK/SK、选地域"
+  msg "    3. /cf           → 填 Cloudflare Token + 域名"
+  msg "    4. /target add   → 填实例 ID + 域名"
+  msg "    5. /switch 实例名 → 换 IP"
   msg ""
-  if [ -n "$pub" ] && [ -n "$lan" ] && [ "$pub" != "$lan" ]; then
-    msg "  公网地址：${BLD}http://${pub}:${PROBE_PORT}${RST}"
-    msg "  内网地址：${BLD}http://${lan}:${PROBE_PORT}${RST}"
-    msg ""
-    warn "这台机器是内网 IP（NAT/桥接内网）。公网地址只有做了端口转发才能从外网访问。"
-    dim "   · 主程序在同一内网 -> 用内网地址"
-    dim "   · 主程序在外网     -> 需把 ${PROBE_PORT} 转发到 ${lan}（PVE：宿主机 iptables/nft 或软路由端口转发）"
-  else
-    msg "  地址：${BLD}http://${pub:-$lan}:${PROBE_PORT}${RST}"
-  fi
-  [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
+  msg "  ${BLD}方式 B：在这台机器用命令行${RST}"
+  msg "    eipguard account add main 你的AK 你的SK cn-hongkong"
+  msg "    eipguard cf 你的CF_TOKEN example.com"
+  msg "    eipguard target add hk main i-xxxxxxxx hk.example.com"
+  msg "    eipguard --check-config"
   msg ""
-  local use_ip="${pub:-$lan}"
-  if [ -n "$lan" ] && [ -n "$pub" ] && [ "$pub" != "$lan" ]; then
-    use_ip="$lan"
-    dim "下面默认用内网地址；若主程序在公网，把 IP 换成 ${pub} 并确认已做端口转发"
-  fi
-  if [ "$ZONE" = "cn" ]; then
-    dim "填进主程序：PROBE_CN_URL=http://${use_ip}:${PROBE_PORT}"
-  else
-    dim "填进主程序：PROBE_OS_URL=http://${use_ip}:${PROBE_PORT}"
-  fi
-  dim "别忘了把上面的 token 填进主程序的 PROBE_AGENT_TOKEN"
-  return 0
-}
-
-port_free() {
-  local port="$1"
-  if command -v ss >/dev/null; then
-    ! ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"
-  else
-    ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null
-  fi
-}
-
-probe_healthy() {
-  local body
-  body="$(curl -fsS --max-time 3 "http://127.0.0.1:${PROBE_PORT}/health" 2>/dev/null)" || return 1
-  case "$body" in
-    *'"ok":true'*|*'"ok": true'*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-ensure_firewall() {
-  local port="$1"
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "$port"/tcp >/dev/null 2>&1 && dim "已放行 ufw $port/tcp"
-  elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
-    firewall-cmd --permanent --add-port="$port"/tcp >/dev/null 2>&1
-    firewall-cmd --reload >/dev/null 2>&1
-    dim "已放行 firewalld $port/tcp"
-  fi
-  dim "云厂商安全组需另外放行 $port/tcp，建议只允许主程序那台机器的 IP"
-}
-
-# =====================================================================
-# 状态 / 日志 / 卸载
-# =====================================================================
-check_probe() {
-  # 用法：--check-probe http://ip:8787 --token xxx
-  local url="${1:-}" tok="${2:-}"
-  if [ -z "$url" ]; then
-    url="$(ask '探针地址（http://IP:8787）' '')"
-  fi
-  if [ -z "$url" ]; then
-    err "需要探针地址"
-    return 1
-  fi
-  if [ -z "$tok" ]; then
-    tok="$(ask '探针 token' '')"
-  fi
-
-  title "检测探针连通性"
-  msg "地址：$url"
+  msg "  ${BLD}管理员绑定${RST}（不知道 chat id 时）"
+  msg "    私聊机器人随便发一句，它会告诉你 chat id，然后："
+  msg "    ${DIM}eipguard --bind 你的chatid${RST}"
   msg ""
-
-  # 1) 网络可达
-  local hostport="${url#*://}"
-  local host="${hostport%%:*}"
-  local port="${hostport##*:}"
-  [ "$port" = "$host" ] && port=8787
-
-  if timeout 5 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
-    ok "TCP 可达 ${host}:${port}"
-  else
-    err "TCP 不可达 ${host}:${port}"
-    msg ""
-    msg "可能原因："
-    msg "  · 国内那台没有公网 IP（家宽常见），从国外访问不到"
-    msg "  · 防火墙/安全组没放行 ${port}"
-    msg "  · 地址填错"
-    msg ""
-    msg "解决办法见文档 docs/家宽探针方案.md"
-    return 1
-  fi
-
-  # 2) 服务身份 + token
-  local body
-  body="$(curl -fsS --max-time 6 "${url%/}/health" 2>/dev/null)"
-  if [ -z "$body" ]; then
-    err "/health 没响应，可能不是探针服务，或端口被别的程序占用"
-    return 1
-  fi
-  case "$body" in
-    *'"ok":true'*|*'"ok": true'*) ok "服务正常：$body" ;;
-    *) err "响应异常：$body"; return 1 ;;
-  esac
-
-  # 3) 真正发一次探测请求，验证 token
-  local probe_body
-  probe_body="$(curl -fsS --max-time 20 -X POST "${url%/}/probe" \
-      -H "X-Probe-Token: ${tok}" -H 'Content-Type: application/json' \
-      -d '{"ip":"1.1.1.1","ports":[443],"sni":"one.one.one.one","attempts":1,"layers":["icmp","tls"],"timeout":4}' 2>/dev/null)"
-
-  if [ -z "$probe_body" ]; then
-    err "探测请求无响应"
-    return 1
-  fi
-  case "$probe_body" in
-    *unauthorized*) err "token 不匹配（两台探针要用同一个 token）"; return 1 ;;
-    *'"ok": true'*|*'"ok":true'*) ;;
-    *) err "探测失败：$probe_body"; return 1 ;;
-  esac
-
-  local zone
-  zone="$(printf '%s' "$probe_body" | sed -n 's/.*"zone": *"\([^"]*\)".*/\1/p')"
-  ok "探测请求成功，zone=${zone}"
-  msg ""
-  msg "  返回值：$(printf '%s' "$probe_body" | head -c 200)"
-  msg ""
-  if [ "$zone" = "cn" ]; then
-    msg "  ${GRN}这台是国内探针，判定可用。${RST}"
-  elif [ "$zone" = "overseas" ]; then
-    msg "  ${GRN}这台是国外探针。${RST}"
-  fi
-  return 0
+  msg "  日志：${BLD}journalctl -u eipguard -f${RST}"
 }
 
 show_status() {
   title "运行状态"
-  printf '  主程序 %-14s %b\n' "$SERVICE_MAIN" "$(svc_state "$SERVICE_MAIN")"
-  printf '  探针   %-14s %b\n' "$SERVICE_PROBE" "$(svc_state "$SERVICE_PROBE")"
+  printf '  服务 %-12s %b\n' "$SERVICE" "$(svc_state "$SERVICE")"
   echo
-  if has_systemd && systemctl is-active --quiet "$SERVICE_MAIN" 2>/dev/null; then
-    local since; since="$(systemctl show -p ActiveEnterTimestamp --value "$SERVICE_MAIN" 2>/dev/null)"
-    [ -n "$since" ] && msg "  主程序启动于：$since"
-  fi
-  if [ -f "$APP_DIR/config.yaml" ]; then
-    echo
-    msg "  配置：$APP_DIR/config.yaml"
-    local n; n="$(grep -c '^  - name:' "$APP_DIR/config.yaml" 2>/dev/null || echo 0)"
-    msg "  实例数：$n"
-    if [ -f "$APP_DIR/data/state.json" ]; then
-      msg "  最近事件："
-      python3 - "$APP_DIR/data/state.json" <<'PY' 2>/dev/null || true
-import json, sys, time
-d = json.load(open(sys.argv[1]))
-for e in (d.get("history") or [])[-5:]:
-    ts = time.strftime("%m-%d %H:%M", time.localtime(e.get("ts", 0)))
-    print(f"    {ts} {e.get('type','?'):16s} {e.get('target','')}")
-PY
-    fi
+  if [ -x /usr/local/bin/eipguard ]; then
+    eipguard --check-config 2>/dev/null | sed 's/^/  /'
+  else
+    dim "  未安装（$APP_DIR 不存在）"
   fi
 }
 
 show_log() {
-  local svc="$SERVICE_MAIN"
-  [ "${1:-}" = "probe" ] && svc="$SERVICE_PROBE"
   has_systemd || die "无 systemd"
   msg "${DIM}Ctrl+C 退出$RST"
-  journalctl -u "$svc" -f -n 50 --no-pager -o cat
-}
-
-do_uninstall() {
-  need_root
-  title "卸载"
-  local which; which="$(ask '卸载哪个？1) 主程序 2) 探针 3) 两个都卸' '1')"
-  case "$which" in
-    1) svc_stop_rm "$SERVICE_MAIN"
-       if confirm "同时删除 $APP_DIR（含配置和密钥）？" n; then rm -rf "$APP_DIR"; fi
-       ok "主程序已卸载" ;;
-    2) svc_stop_rm "$SERVICE_PROBE"
-       if confirm "同时删除 $PROBE_DIR？" n; then rm -rf "$PROBE_DIR"; fi
-       ok "探针已卸载" ;;
-    3) svc_stop_rm "$SERVICE_MAIN"; svc_stop_rm "$SERVICE_PROBE"
-       if confirm "同时删除所有数据？" n; then rm -rf "$APP_DIR" "$PROBE_DIR"; fi
-       ok "已卸载" ;;
-    *) warn "取消" ;;
-  esac
+  journalctl -u "$SERVICE" -f -n 50 --no-pager -o cat
 }
 
 do_update() {
@@ -1024,126 +422,154 @@ do_update() {
     rm -rf "$APP_DIR/src"; cp -r "$src/src" "$APP_DIR/"
     "$APP_DIR/.venv/bin/pip" install -q --no-deps -e "$APP_DIR" >/dev/null
     chown -R eipguard:eipguard "$APP_DIR" 2>/dev/null || true
-    svc_start "$SERVICE_MAIN"
+    if has_systemd; then svc_start "$SERVICE"; fi
     ok "代码已更新（配置未动）"
   else
-    warn "主程序未安装，走完整安装流程"
+    warn "未安装，走完整安装"
     install_main
   fi
-  [ -n "$SRC_TMP" ] && rm -rf "$SRC_TMP"
 }
 
-# =====================================================================
-# 菜单
-# =====================================================================
+do_uninstall() {
+  need_root
+  title "卸载"
+  if has_systemd; then
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${SERVICE}.service"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f /usr/local/bin/eipguard
+  if confirm "同时删除 $APP_DIR（含配置和密钥）？" n; then
+    rm -rf "$APP_DIR"
+    ok "已完全删除"
+  else
+    ok "服务已卸载，$APP_DIR 保留"
+  fi
+}
+
 menu() {
   while :; do
     clear 2>/dev/null || true
-    msg ""
-    printf '%s╭──────────────────────────────────────────╮%s\n' "$BLU" "$RST"
-    printf '%s│%s  %sEIP Guard%s · 阿里云 EIP 被墙自动更换       %s│%s\n' "$BLU" "$RST" "$BLD" "$RST" "$BLU" "$RST"
-    printf '%s╰──────────────────────────────────────────╯%s\n' "$BLU" "$RST"
-    printf '  主程序 %b    探针 %b\n\n' "$(svc_state "$SERVICE_MAIN")" "$(svc_state "$SERVICE_PROBE")"
-    msg "  ${BLD}1${RST}) 安装 / 更新主程序"
-    msg "  ${BLD}2${RST}) 安装 / 更新探针（国内或国外）"
-    msg "  ${BLD}3${RST}) 查看状态"
-    msg "  ${BLD}4${RST}) 查看日志"
-    msg "  ${BLD}5${RST}) 编辑配置 / 重启"
-    msg "  ${BLD}6${RST}) 更新代码（保留配置）"
+    echo
+    printf '%s╭──────────────────────────────────────────────╮%s\n' "$BLU" "$RST"
+    printf '%s│%s  %sEIP Guard%s · 阿里云 EIP 手动换 IP           %s│%s\n' "$BLU" "$RST" "$BLD" "$RST" "$BLU" "$RST"
+    printf '%s╰──────────────────────────────────────────────╯%s\n' "$BLU" "$RST"
+    printf '  服务 %b\n\n' "$(svc_state "$SERVICE")"
+    msg "  ${BLD}1${RST}) 安装 / 更新"
+    msg "  ${BLD}2${RST}) 查看状态"
+    msg "  ${BLD}3${RST}) 查看日志"
+    msg "  ${BLD}4${RST}) 命令行添加账号 / 实例 / CF"
+    msg "  ${BLD}5${RST}) 绑定管理员 chat id"
+    msg "  ${BLD}6${RST}) 重启服务"
     msg "  ${BLD}7${RST}) 卸载"
     msg "  ${BLD}0${RST}) 退出"
     msg ""
-    local c; c="$(ask '请选择' '0')"
+    local c; c="$(ask '选择' '0')"
     case "$c" in
       1) install_main ;;
-      2) ZONE=""; install_probe ;;
-      3) show_status ;;
-      4) local w; w="$(ask '看哪个日志？1) 主程序 2) 探针' '1')"
-         [ "$w" = "2" ] && show_log probe || show_log ;;
-      5) ${EDITOR:-vi} "$APP_DIR/config.yaml" 2>/dev/null || vi "$APP_DIR/config.yaml"
-         if confirm '重启主程序使配置生效？' y; then svc_start "$SERVICE_MAIN"; fi ;;
-      6) do_update ;;
+      2) show_status ;;
+      3) show_log ;;
+      4) cmdline_wizard ;;
+      5) bind_wizard ;;
+      6) if has_systemd; then svc_start "$SERVICE"; else warn "无 systemd"; fi ;;
       7) do_uninstall ;;
       0|q|Q) exit 0 ;;
-      *) warn "无效选择" ; sleep 1 ;;
+      *) warn "无效选择"; sleep 1 ;;
     esac
     echo
     ask '按回车继续' '' >/dev/null
   done
 }
 
-# =====================================================================
-# 参数解析
-# =====================================================================
-ACTION=""
-ZONE=""
-PROBE_TOKEN="${PROBE_TOKEN:-}"
-PROBE_MODE="${PROBE_MODE:-}"          # server（默认，需公网）| client（反向，家宽）
-PROBE_HUB="${PROBE_HUB:-}"
-PROBE_PORT="${PROBE_PORT:-8787}"
-NON_INTERACTIVE=0
+cmdline_wizard() {
+  need_root
+  title "命令行添加"
+  [ -x /usr/local/bin/eipguard ] || die "还没安装"
+  msg "  1) 添加阿里云账号"
+  msg "  2) 添加实例"
+  msg "  3) 设置 Cloudflare"
+  msg "  4) 查看当前配置"
+  local c; c="$(ask '选择' '1')"
+  case "$c" in
+    1)
+      local n ak sk reg
+      n="$(ask '账号代号（英文）' 'main')"
+      ak="$(ask 'AccessKey ID' '')"
+      sk="$(ask_secret 'AccessKey Secret')"
+      reg="$(ask '地域' 'cn-hongkong')"
+      eipguard account add "$n" "$ak" "$sk" "$reg"
+      ;;
+    2)
+      local tn ta ti td
+      tn="$(ask '实例代号' 'hk-main')"
+      ta="$(ask '用哪个账号代号' 'main')"
+      ti="$(ask '实例 ID（i-xxxxxxxx）' '')"
+      td="$(ask '域名（空格分隔，可空）' '')"
+      # shellcheck disable=SC2086
+      eipguard target add "$tn" "$ta" "$ti" $td
+      ;;
+    3)
+      local tok zone
+      tok="$(ask_secret 'Cloudflare API Token')"
+      zone="$(ask '域名' 'example.com')"
+      eipguard cf "$tok" "$zone"
+      ;;
+    4) eipguard --check-config ;;
+  esac
+}
+
+bind_wizard() {
+  need_root
+  title "绑定管理员"
+  msg "在 Telegram 里私聊机器人发任意消息，它会回复你的 chat id。"
+  local cid; cid="$(ask '你的 chat id' '')"
+  [ -z "$cid" ] && return
+  eipguard --bind "$cid"
+}
 
 usage() {
   cat <<EOF
-${BLD}EIP Guard 安装脚本${RST}
+${BLD}EIP Guard${RST} · 阿里云 EIP 手动换 IP + Cloudflare 解析 + Telegram
 
-  ${BLD}bash <(curl -Ls https://raw.githubusercontent.com/kingsnakerrr/eip-guard/main/install.sh)${RST}
+  ${BLD}bash <(curl -Ls https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh)${RST}
       交互菜单（推荐）
 
-  install.sh --probe --zone cn                  装国内探针（有公网 IP）
-  install.sh --probe --zone overseas            装国外探针（有公网 IP）
-  install.sh --probe --mode client --zone cn    装反向探针（家宽/NAT，无需公网 IP）
-
-  install.sh --install              安装 / 更新主程序
-  install.sh --status | --log | --update | --uninstall
-  install.sh --check-probe http://IP:8787 --token xxx   验证探针能否从本机访问
+  install.sh --install     安装 / 更新
+  install.sh --status      查看状态
+  install.sh --log         查看日志
+  install.sh --update      只更新代码
+  install.sh --uninstall   卸载
 
 选项：
-  --zone cn|overseas    探针所在位置
-  --token TOKEN         探针共享 token（不填则生成）
-  --port PORT           探针端口（默认 8787）
-  --dir PATH            主程序目录（默认 $APP_DIR）
-  --probe-dir PATH      探针目录（默认 $PROBE_DIR）
-  --pip-index URL       pip 镜像
-  --non-interactive     不做任何提问，全部从环境变量读
-  -h, --help            显示本帮助
+  --dir PATH          安装目录（默认 $APP_DIR）
+  --pip-index URL     pip 镜像
+  --non-interactive   不提问，全部用环境变量
 
 环境变量：
-  REPO BRANCH APP_DIR PROBE_DIR PIP_INDEX
-  TG_BOT_TOKEN TG_ADMIN_IDS TG_CHANNEL_ID TG_BIND_TOKEN TG_PROXY
-  ALIYUN_AK_ID ALIYUN_AK_SECRET ALIYUN_REGION ALIYUN_NAME
-  ALIYUN_AK_ID_2 ALIYUN_AK_SECRET_2
-  CF_API_TOKEN CF_ZONE_NAME
-  PROBE_CN_URL PROBE_OS_URL PROBE_AGENT_TOKEN
-  TARGETS   非交互模式的实例列表，每行：
-            name|account|instance_id|port|aux_ports|dns_records
-            例：hk-main|main|i-j6cxxx|443|22 80|hk.example.com api.example.com
+  TG_BOT_TOKEN TG_ADMIN_IDS TG_BIND_TOKEN TG_PROXY
 
-非交互示例：
-  TARGETS='hk-main|main|i-j6cxxx|443|22 80|hk.example.com' \
-  TG_BOT_TOKEN=... ALIYUN_AK_ID=... ./install.sh --install --non-interactive
+装完后也可以直接用命令行管理（不用 Telegram）：
+  eipguard account add main AK SK cn-hongkong
+  eipguard cf TOKEN example.com
+  eipguard target add hk main i-xxxx hk.example.com
+  eipguard --bind 你的chatid
+  eipguard --check-config
+  eipguard --status
 EOF
 }
+
+ACTION=""
+NON_INTERACTIVE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --install|--main) ACTION="install" ;;
-    --probe) ACTION="probe" ;;
-    --mode) PROBE_MODE="${2:-}"; shift ;;
     --status) ACTION="status" ;;
-    --check-probe)
-      ACTION="check_probe"
-      [ $# -ge 2 ] && case "${2:-}" in http*) CHECK_URL="$2"; shift ;; esac
-      ;;
     --log) ACTION="log" ;;
     --update) ACTION="update" ;;
     --uninstall) ACTION="uninstall" ;;
-    --zone) ZONE="${2:-}"; shift ;;
-    --token) PROBE_TOKEN="${2:-}"; CHECK_TOKEN="${2:-}"; shift ;;
-    --port) PROBE_PORT="${2:-}"; shift ;;
     --dir) APP_DIR="${2:-}"; shift ;;
-    --probe-dir) PROBE_DIR="${2:-}"; shift ;;
-    --hub) PROBE_HUB="${2:-}"; shift ;;
     --pip-index) PIP_INDEX="${2:-}"; shift ;;
     --repo) REPO="${2:-}"; shift ;;
     --non-interactive) NON_INTERACTIVE=1 ;;
@@ -1155,9 +581,7 @@ done
 
 case "$ACTION" in
   install) install_main ;;
-  probe) install_probe ;;
   status) show_status ;;
-  check_probe) check_probe "${CHECK_URL:-}" "${CHECK_TOKEN:-}" ;;
   log) show_log ;;
   update) do_update ;;
   uninstall) do_uninstall ;;
